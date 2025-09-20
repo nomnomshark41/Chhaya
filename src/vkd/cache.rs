@@ -232,6 +232,14 @@ impl ProofQueue {
     fn accepted_path(&self, cid: &Cid) -> PathBuf {
         self.accepted_dir.join(cid.to_string())
     }
+
+    pub fn last_verified_for(&self, log_id: &[u8]) -> Result<Option<VerifiedSth>, ProofQueueError> {
+        let map = self.load_last_verified()?;
+        Ok(map
+            .into_iter()
+            .find(|(id, _)| id.as_slice() == log_id)
+            .map(|(_, sth)| sth))
+    }
 }
 
 fn encode_proof(proof: &VkdProof) -> Result<(Cid, Vec<u8>), ProofQueueError> {

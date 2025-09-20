@@ -559,6 +559,25 @@ pub fn verify_vkd_proof(
         return None;
     }
 
+    if let Some(prev) = prev_sth.as_ref() {
+        if prev.log_id != proof.log_id {
+            return None;
+        }
+        if proof.sth_tree_size < prev.tree_size {
+            return None;
+        }
+        if proof.sth_time < prev.sth_time {
+            return None;
+        }
+        if proof.sth_tree_size == prev.tree_size {
+            if proof.sth_root_hash != prev.root_hash {
+                return None;
+            }
+        } else if proof.consistency_proof.is_none() {
+            return None;
+        }
+    }
+
     let mut sth_tuple = Vec::new();
     sth_tuple.extend_from_slice(&proof.sth_root_hash);
     sth_tuple.extend_from_slice(&proof.sth_tree_size.to_le_bytes());
@@ -1425,6 +1444,7 @@ pub enum HandshakeError {
     Replay,
     TokenUsed,
     Generic,
+    DirectoryRollback,
 }
 
 /// Runtime inputs required for the responder handshake flow.
@@ -1441,6 +1461,7 @@ pub struct ResponderEnv<'a> {
     pub replay: &'a dyn ReplayCache,
     pub spend_verifier: &'a dyn SpendVerifier,
     pub trust_anchors: &'a VkdTrustAnchors,
+    pub last_verified_sth: Option<&'a VerifiedSth>,
 }
 
 /// Responder-owned context tying together message, directory entry, and secrets.
@@ -1467,6 +1488,7 @@ pub fn responder_handshake_resp<K: Kem>(
         replay,
         spend_verifier,
         trust_anchors,
+        last_verified_sth,
     } = env;
     let ResponderSession {
         message: m1,
@@ -1575,9 +1597,10 @@ pub fn responder_handshake_resp<K: Kem>(
         jitter_pre_auth();
         return Err(HandshakeError::Generic);
     }
-    if verify_vkd_proof(vkd, trust_anchors, None).is_none() {
+    let prior_sth = last_verified_sth.cloned();
+    if verify_vkd_proof(vkd, trust_anchors, prior_sth).is_none() {
         jitter_pre_auth();
-        return Err(HandshakeError::Generic);
+        return Err(HandshakeError::DirectoryRollback);
     }
 
     let bind = compute_transcript_bind_v2(TranscriptBindContext {
@@ -2584,6 +2607,7 @@ mod tests {
     use super::dr_crypto;
     use super::*;
     use crate::net::ratelimit::{RateLimitParams, RateLimiter};
+    use crate::vkd::cache::{ProofProcessingResult, ProofQueue};
     use libp2p_identity::{Keypair, PeerId};
     use proptest::prelude::*;
     use std::collections::HashSet;
@@ -2746,6 +2770,120 @@ mod tests {
         assert!(!verifier2.verify_spend_receipt(&Vec::new(), 0, &[0u8; 32], &nullifier, &[], 0));
     }
 
+    fn vkd_proof_chain<K: Kem>(
+        record: &DirectoryRecord<K>,
+        keys: &TestVkdKeys,
+    ) -> (VkdProof, VkdProof) {
+        use crate::directory::TransparencyLog;
+        use crate::quorum::bls_sign;
+        use group::Curve;
+
+        let quorum_digest = hash_quorum_descriptor(&record.quorum_desc).unwrap();
+        let bundle_cid = directory_record_cid(record).unwrap();
+        let quorum_cid = quorum_descriptor_cid(&record.quorum_desc).unwrap();
+
+        let mut leaf_data = Vec::new();
+        leaf_data.extend_from_slice(&record.did);
+        leaf_data.extend_from_slice(&record.epoch.to_le_bytes());
+        leaf_data.extend_from_slice(&record.x25519_prekey);
+        leaf_data.extend_from_slice(&record.kem_pk);
+        leaf_data.extend_from_slice(&record.prekey_batch_root);
+        leaf_data.extend_from_slice(&quorum_digest);
+        leaf_data.extend_from_slice(&cid_digest(&bundle_cid));
+        leaf_data.extend_from_slice(&cid_digest(&quorum_cid));
+        let leaf = h256(&leaf_data);
+
+        let mut log = TransparencyLog::new();
+        log.append(leaf).expect("append initial leaf");
+        let proof_initial = log.prove(0).expect("prove initial leaf");
+        let root_initial = log.root();
+        let tree_size_initial = 1u64;
+        let sth_time_initial = 100u64;
+
+        let mut sth_tuple_initial = Vec::new();
+        sth_tuple_initial.extend_from_slice(&root_initial);
+        sth_tuple_initial.extend_from_slice(&tree_size_initial.to_le_bytes());
+        sth_tuple_initial.extend_from_slice(&sth_time_initial.to_le_bytes());
+        sth_tuple_initial.extend_from_slice(keys.trust.log_id());
+        let sth_sig_initial = bls_sign(&keys.log_sk, &sth_tuple_initial, SIG_DST)
+            .to_affine()
+            .to_compressed()
+            .to_vec();
+        let witness_sigs_initial: Vec<Vec<u8>> = keys
+            .witness_sks
+            .iter()
+            .map(|sk| {
+                bls_sign(sk, &sth_tuple_initial, SIG_DST)
+                    .to_affine()
+                    .to_compressed()
+                    .to_vec()
+            })
+            .collect();
+        let vrf_sig = bls_sign(&keys.vrf_sk, &leaf, SIG_DST)
+            .to_affine()
+            .to_compressed()
+            .to_vec();
+
+        let initial = VkdProof {
+            log_id: keys.trust.log_id().to_vec(),
+            sth_root_hash: root_initial,
+            sth_tree_size: tree_size_initial,
+            sth_time: sth_time_initial,
+            sth_sig: sth_sig_initial,
+            witness_sigs: witness_sigs_initial,
+            inclusion_hash: leaf,
+            inclusion_proof: proof_initial,
+            consistency_proof: None,
+            vrf_proof: vrf_sig.clone(),
+            bundle_cid,
+            quorum_desc_cid: quorum_cid,
+        };
+
+        let extra_leaf = h256(b"directory:next");
+        log.append(extra_leaf).expect("append additional leaf");
+        let proof_update = log.prove(0).expect("prove updated leaf");
+        let root_update = log.root();
+        let tree_size_update = 2u64;
+        let sth_time_update = 200u64;
+
+        let mut sth_tuple_update = Vec::new();
+        sth_tuple_update.extend_from_slice(&root_update);
+        sth_tuple_update.extend_from_slice(&tree_size_update.to_le_bytes());
+        sth_tuple_update.extend_from_slice(&sth_time_update.to_le_bytes());
+        sth_tuple_update.extend_from_slice(keys.trust.log_id());
+        let sth_sig_update = bls_sign(&keys.log_sk, &sth_tuple_update, SIG_DST)
+            .to_affine()
+            .to_compressed()
+            .to_vec();
+        let witness_sigs_update: Vec<Vec<u8>> = keys
+            .witness_sks
+            .iter()
+            .map(|sk| {
+                bls_sign(sk, &sth_tuple_update, SIG_DST)
+                    .to_affine()
+                    .to_compressed()
+                    .to_vec()
+            })
+            .collect();
+
+        let update = VkdProof {
+            log_id: keys.trust.log_id().to_vec(),
+            sth_root_hash: root_update,
+            sth_tree_size: tree_size_update,
+            sth_time: sth_time_update,
+            sth_sig: sth_sig_update,
+            witness_sigs: witness_sigs_update,
+            inclusion_hash: leaf,
+            inclusion_proof: proof_update,
+            consistency_proof: Some(vec![root_update]),
+            vrf_proof: vrf_sig,
+            bundle_cid,
+            quorum_desc_cid: quorum_cid,
+        };
+
+        (initial, update)
+    }
+
     #[test]
     fn vkd_proof_verification() {
         use crate::directory::TransparencyLog;
@@ -2877,6 +3015,232 @@ mod tests {
     }
 
     #[test]
+    fn responder_accepts_monotonic_vkd_update() {
+        let (record, mut bob_state) = generate_directory_record::<MlKem1024>(
+            b"did:example".to_vec(),
+            1,
+            sample_quorum_desc(1),
+        )
+        .unwrap();
+        let spend = make_receipt(record.prekey_batch_root);
+        let replay = TestReplay::default();
+        let verifier = TestSpendVerifier::default();
+        let server_secret = [7u8; 32];
+        let mut schedule = KeySchedule::new(2, 3, u64::MAX);
+        schedule.rotate(&server_secret, COOKIE_FMT_V1, 0);
+        let mut puzzles = AdaptivePuzzleDifficulty::new(4, 8);
+        let mut rate_limiter = RateLimiter::unlimited();
+
+        let vkd_keys = TestVkdKeys::single_witness();
+        let (initial_proof, updated_proof) = vkd_proof_chain(&record, &vkd_keys);
+        let temp = tempdir().expect("tempdir");
+        let queue = ProofQueue::new(temp.path()).expect("queue");
+        queue.enqueue(&initial_proof).expect("enqueue initial");
+        let results = queue
+            .process_pending(&vkd_keys.trust)
+            .expect("process initial");
+        match results.as_slice() {
+            [ProofProcessingResult::Accepted { .. }] => {}
+            other => panic!("unexpected processing result {other:?}"),
+        }
+        let cached_sth = queue
+            .last_verified_for(vkd_keys.trust.log_id())
+            .expect("load cache")
+            .expect("cached sth present");
+
+        let (mut m1, mut alice_state) =
+            initiator_handshake_init::<MlKem1024>(&record, spend.clone(), None, updated_proof)
+                .expect("initiator init");
+        let keys = schedule.active_keys(1_000_000);
+        let retry = match responder_handshake_resp::<MlKem1024>(
+            ResponderEnv {
+                keys: &keys,
+                threshold: schedule.threshold(),
+                now_ts: 1_000_000,
+                ttl_secs: 300,
+                remote_ip: None,
+                peer_id: None,
+                puzzle_id: "client1",
+                puzzles: &mut puzzles,
+                rate_limiter: &mut rate_limiter,
+                replay: &replay,
+                spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
+                last_verified_sth: Some(&cached_sth),
+            },
+            ResponderSession {
+                message: &m1,
+                directory: &record,
+                state: &mut bob_state,
+            },
+        ) {
+            Err(HandshakeError::Retry(cookie)) => cookie,
+            Err(other) => panic!("unexpected handshake error: {other:?}"),
+            Ok(_) => panic!("expected retry without cookie"),
+        };
+
+        let mut solved = retry.clone();
+        solved.nonce = solve_puzzle(&solved.puzzle);
+        m1.cookie = Some(solved);
+        let quorum_digest = hash_quorum_descriptor(&record.quorum_desc).unwrap();
+        m1.transcript_bind = compute_transcript_bind_v2(TranscriptBindContext {
+            eph_x25519_pub: &m1.eph_x25519_pub,
+            x25519_prekey: &record.x25519_prekey,
+            kem_ciphertext: &m1.kem_ciphertext,
+            did: &m1.did,
+            epoch: m1.epoch,
+            prekey_batch_root: &m1.prekey_batch_root,
+            spend: &m1.spend,
+            sth_cid: &m1.sth_cid,
+            bundle_cid: &m1.bundle_cid,
+            quorum_desc_digest: &quorum_digest,
+            vkd: &m1.vkd_proof,
+            pad: &m1.pad,
+            cookie: m1.cookie.as_ref(),
+        });
+        alice_state.transcript_bind = m1.transcript_bind;
+
+        let keys = schedule.active_keys(1_000_010);
+        let result = responder_handshake_resp::<MlKem1024>(
+            ResponderEnv {
+                keys: &keys,
+                threshold: schedule.threshold(),
+                now_ts: 1_000_010,
+                ttl_secs: 300,
+                remote_ip: None,
+                peer_id: None,
+                puzzle_id: "client1",
+                puzzles: &mut puzzles,
+                rate_limiter: &mut rate_limiter,
+                replay: &replay,
+                spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
+                last_verified_sth: Some(&cached_sth),
+            },
+            ResponderSession {
+                message: &m1,
+                directory: &record,
+                state: &mut bob_state,
+            },
+        );
+        assert!(result.is_ok(), "monotonic VKD update should be accepted");
+    }
+
+    #[test]
+    fn responder_rejects_stale_vkd_proof() {
+        let (record, mut bob_state) = generate_directory_record::<MlKem1024>(
+            b"did:example".to_vec(),
+            1,
+            sample_quorum_desc(1),
+        )
+        .unwrap();
+        let spend = make_receipt(record.prekey_batch_root);
+        let replay = TestReplay::default();
+        let verifier = TestSpendVerifier::default();
+        let server_secret = [11u8; 32];
+        let mut schedule = KeySchedule::new(2, 3, u64::MAX);
+        schedule.rotate(&server_secret, COOKIE_FMT_V1, 0);
+        let mut puzzles = AdaptivePuzzleDifficulty::new(4, 8);
+        let mut rate_limiter = RateLimiter::unlimited();
+
+        let vkd_keys = TestVkdKeys::single_witness();
+        let (initial_proof, updated_proof) = vkd_proof_chain(&record, &vkd_keys);
+        let temp = tempdir().expect("tempdir");
+        let queue = ProofQueue::new(temp.path()).expect("queue");
+        queue.enqueue(&initial_proof).expect("enqueue initial");
+        queue
+            .process_pending(&vkd_keys.trust)
+            .expect("process initial");
+        queue.enqueue(&updated_proof).expect("enqueue updated");
+        queue
+            .process_pending(&vkd_keys.trust)
+            .expect("process updated");
+        let cached_latest = queue
+            .last_verified_for(vkd_keys.trust.log_id())
+            .expect("load cache")
+            .expect("latest sth present");
+
+        let (mut m1, _) =
+            initiator_handshake_init::<MlKem1024>(&record, spend, None, initial_proof)
+                .expect("initiator init");
+        let keys = schedule.active_keys(1_000_000);
+        let retry = match responder_handshake_resp::<MlKem1024>(
+            ResponderEnv {
+                keys: &keys,
+                threshold: schedule.threshold(),
+                now_ts: 1_000_000,
+                ttl_secs: 300,
+                remote_ip: None,
+                peer_id: None,
+                puzzle_id: "client1",
+                puzzles: &mut puzzles,
+                rate_limiter: &mut rate_limiter,
+                replay: &replay,
+                spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
+                last_verified_sth: Some(&cached_latest),
+            },
+            ResponderSession {
+                message: &m1,
+                directory: &record,
+                state: &mut bob_state,
+            },
+        ) {
+            Err(HandshakeError::Retry(cookie)) => cookie,
+            Err(other) => panic!("unexpected handshake error: {other:?}"),
+            Ok(_) => panic!("expected retry without cookie"),
+        };
+
+        let mut solved = retry.clone();
+        solved.nonce = solve_puzzle(&solved.puzzle);
+        m1.cookie = Some(solved);
+        let quorum_digest = hash_quorum_descriptor(&record.quorum_desc).unwrap();
+        m1.transcript_bind = compute_transcript_bind_v2(TranscriptBindContext {
+            eph_x25519_pub: &m1.eph_x25519_pub,
+            x25519_prekey: &record.x25519_prekey,
+            kem_ciphertext: &m1.kem_ciphertext,
+            did: &m1.did,
+            epoch: m1.epoch,
+            prekey_batch_root: &m1.prekey_batch_root,
+            spend: &m1.spend,
+            sth_cid: &m1.sth_cid,
+            bundle_cid: &m1.bundle_cid,
+            quorum_desc_digest: &quorum_digest,
+            vkd: &m1.vkd_proof,
+            pad: &m1.pad,
+            cookie: m1.cookie.as_ref(),
+        });
+
+        let keys = schedule.active_keys(1_000_010);
+        match responder_handshake_resp::<MlKem1024>(
+            ResponderEnv {
+                keys: &keys,
+                threshold: schedule.threshold(),
+                now_ts: 1_000_010,
+                ttl_secs: 300,
+                remote_ip: None,
+                peer_id: None,
+                puzzle_id: "client1",
+                puzzles: &mut puzzles,
+                rate_limiter: &mut rate_limiter,
+                replay: &replay,
+                spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
+                last_verified_sth: Some(&cached_latest),
+            },
+            ResponderSession {
+                message: &m1,
+                directory: &record,
+                state: &mut bob_state,
+            },
+        ) {
+            Err(HandshakeError::DirectoryRollback) => {}
+            Err(other) => panic!("unexpected handshake error: {other:?}"),
+            Ok(_) => panic!("stale proof should have been rejected"),
+        }
+    }
+
+    #[test]
     fn full_flow_with_spend() -> Result<(), HandshakeError> {
         let (record, mut bob_state) = generate_directory_record::<MlKem1024>(
             b"did:example".to_vec(),
@@ -2912,6 +3276,7 @@ mod tests {
                 replay: &replay,
                 spend_verifier: &verifier,
                 trust_anchors: &vkd_keys.trust,
+                last_verified_sth: None,
             },
             ResponderSession {
                 message: &m1,
@@ -2959,6 +3324,7 @@ mod tests {
                 replay: &replay,
                 spend_verifier: &verifier,
                 trust_anchors: &vkd_keys.trust,
+                last_verified_sth: None,
             },
             ResponderSession {
                 message: &m1_retry,
@@ -3058,6 +3424,7 @@ mod tests {
                 replay: &replay,
                 spend_verifier: &verifier,
                 trust_anchors: &vkd_keys.trust,
+                last_verified_sth: None,
             },
             ResponderSession {
                 message: &m1,
@@ -3103,6 +3470,7 @@ mod tests {
                 replay: &replay,
                 spend_verifier: &verifier,
                 trust_anchors: &vkd_keys.trust,
+                last_verified_sth: None,
             },
             ResponderSession {
                 message: &m1_retry,
@@ -3128,6 +3496,7 @@ mod tests {
                     replay: &replay,
                     spend_verifier: &verifier,
                     trust_anchors: &vkd_keys.trust,
+                    last_verified_sth: None,
                 },
                 ResponderSession {
                     message: &m1_retry,
@@ -3156,6 +3525,7 @@ mod tests {
                 replay: &replay,
                 spend_verifier: &verifier,
                 trust_anchors: &vkd_keys.trust,
+                last_verified_sth: None,
             },
             ResponderSession {
                 message: &m1b,
@@ -3202,6 +3572,7 @@ mod tests {
                     replay: &replay,
                     spend_verifier: &verifier,
                     trust_anchors: &vkd_keys.trust,
+                    last_verified_sth: None,
                 },
                 ResponderSession {
                     message: &m1b_retry,
@@ -3248,6 +3619,7 @@ mod tests {
                 replay: &replay,
                 spend_verifier: &verifier,
                 trust_anchors: &vkd_keys.trust,
+                last_verified_sth: None,
             },
             ResponderSession {
                 message: &m1,
@@ -3295,6 +3667,7 @@ mod tests {
                     replay: &replay,
                     spend_verifier: &verifier,
                     trust_anchors: &vkd_keys.trust,
+                    last_verified_sth: None,
                 },
                 ResponderSession {
                     message: &m1_tamper,
@@ -3484,6 +3857,7 @@ mod tests {
                         replay: &replay,
                         spend_verifier: &verifier,
                         trust_anchors: &vkd_keys.trust,
+                        last_verified_sth: None,
                     },
                     ResponderSession {
                         message: &m1,
@@ -3531,6 +3905,7 @@ mod tests {
                         replay: &replay,
                         spend_verifier: &verifier,
                         trust_anchors: &vkd_keys.trust,
+                        last_verified_sth: None,
                     },
                     ResponderSession {
                         message: &m1,
@@ -3573,6 +3948,7 @@ mod tests {
                     replay: &replay,
                     spend_verifier: &verifier,
                     trust_anchors: &vkd_keys.trust,
+                    last_verified_sth: None,
                 },
                 ResponderSession {
                     message: &legit_m1,
@@ -3618,6 +3994,7 @@ mod tests {
                     replay: &replay,
                     spend_verifier: &verifier,
                     trust_anchors: &vkd_keys.trust,
+                    last_verified_sth: None,
                 },
                 ResponderSession {
                     message: &legit_m1,
