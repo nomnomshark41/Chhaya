@@ -799,6 +799,8 @@ pub struct AuthedSession(pub SessionKeys);
 /// Tracks handshake transcripts to prevent replay attacks.
 pub trait ReplayCache: Send + Sync {
     fn replay_seen_and_mark(&self, session_id: &[u8; 32]) -> bool;
+    fn cookie_mark_attempt(&self, mac: &[u8; 32], ts: u64) -> bool;
+    fn cookie_mark_spent(&self, mac: &[u8; 32], ts: u64);
 }
 
 fn h256(bytes: &[u8]) -> [u8; 32] {
@@ -1533,14 +1535,39 @@ pub fn responder_handshake_resp<K: Kem>(
         c.extend_from_slice(&m1.pad);
         c
     };
-    let cookie_ok = match &m1.cookie {
-        Some(c) => keys.iter().any(|k| {
-            verify_retry_cookie(&k.shares, threshold, k.key_id, &ctx, now_ts, ttl_secs, c)
-                .unwrap_or(false)
-        }),
-        None => false,
+    let cookie = match &m1.cookie {
+        Some(cookie) => cookie,
+        None => {
+            let diff = puzzles.record_failure(puzzle_id);
+            let key = &keys[0];
+            let cookie = make_retry_cookie(&key.shares, threshold, key.key_id, &ctx, now_ts, diff)
+                .map_err(|_| {
+                    jitter_pre_auth();
+                    HandshakeError::Generic
+                })?;
+            jitter_pre_auth();
+            return Err(HandshakeError::Retry(cookie));
+        }
     };
+    let cookie_ok = keys.iter().any(|k| {
+        verify_retry_cookie(
+            &k.shares, threshold, k.key_id, &ctx, now_ts, ttl_secs, cookie,
+        )
+        .unwrap_or(false)
+    });
     if !cookie_ok {
+        let diff = puzzles.record_failure(puzzle_id);
+        let key = &keys[0];
+        let cookie = make_retry_cookie(&key.shares, threshold, key.key_id, &ctx, now_ts, diff)
+            .map_err(|_| {
+                jitter_pre_auth();
+                HandshakeError::Generic
+            })?;
+        jitter_pre_auth();
+        return Err(HandshakeError::Retry(cookie));
+    }
+
+    if replay.cookie_mark_attempt(&cookie.mac, cookie.ts) {
         let diff = puzzles.record_failure(puzzle_id);
         let key = &keys[0];
         let cookie = make_retry_cookie(&key.shares, threshold, key.key_id, &ctx, now_ts, diff)
@@ -1563,13 +1590,13 @@ pub fn responder_handshake_resp<K: Kem>(
         jitter_pre_auth();
         return Err(HandshakeError::Retry(cookie));
     }
-    puzzles.record_success(puzzle_id);
 
     if m1.did != dir.did
         || m1.epoch != dir.epoch
         || m1.prekey_batch_root != dir.prekey_batch_root
         || m1.spend.batch_root != dir.prekey_batch_root
     {
+        puzzles.record_failure(puzzle_id);
         jitter_pre_auth();
         return Err(HandshakeError::Generic);
     }
@@ -1578,31 +1605,50 @@ pub fn responder_handshake_resp<K: Kem>(
     let bundle_cid_msg = &m1.bundle_cid;
 
     let vkd = &m1.vkd_proof;
-    let quorum_digest = hash_quorum_descriptor(&dir.quorum_desc).map_err(|_| {
-        jitter_pre_auth();
-        HandshakeError::Generic
-    })?;
-    let bundle_cid = directory_record_cid(dir).map_err(|_| {
-        jitter_pre_auth();
-        HandshakeError::Generic
-    })?;
-    let quorum_cid = quorum_descriptor_cid(&dir.quorum_desc).map_err(|_| {
-        jitter_pre_auth();
-        HandshakeError::Generic
-    })?;
+    let quorum_digest = match hash_quorum_descriptor(&dir.quorum_desc) {
+        Ok(digest) => digest,
+        Err(_) => {
+            puzzles.record_failure(puzzle_id);
+            jitter_pre_auth();
+            return Err(HandshakeError::Generic);
+        }
+    };
+    let bundle_cid = match directory_record_cid(dir) {
+        Ok(cid) => cid,
+        Err(_) => {
+            puzzles.record_failure(puzzle_id);
+            jitter_pre_auth();
+            return Err(HandshakeError::Generic);
+        }
+    };
+    let quorum_cid = match quorum_descriptor_cid(&dir.quorum_desc) {
+        Ok(cid) => cid,
+        Err(_) => {
+            puzzles.record_failure(puzzle_id);
+            jitter_pre_auth();
+            return Err(HandshakeError::Generic);
+        }
+    };
     if bundle_cid_msg != &bundle_cid {
+        puzzles.record_failure(puzzle_id);
         jitter_pre_auth();
         return Err(HandshakeError::Generic);
     }
     if vkd.bundle_cid != bundle_cid || vkd.quorum_desc_cid != quorum_cid {
+        puzzles.record_failure(puzzle_id);
         jitter_pre_auth();
         return Err(HandshakeError::Generic);
     }
-    let expected_sth_cid = sth_cid_from_proof(vkd).map_err(|_| {
-        jitter_pre_auth();
-        HandshakeError::Generic
-    })?;
+    let expected_sth_cid = match sth_cid_from_proof(vkd) {
+        Ok(cid) => cid,
+        Err(_) => {
+            puzzles.record_failure(puzzle_id);
+            jitter_pre_auth();
+            return Err(HandshakeError::Generic);
+        }
+    };
     if sth_cid != &expected_sth_cid {
+        puzzles.record_failure(puzzle_id);
         jitter_pre_auth();
         return Err(HandshakeError::Generic);
     }
@@ -1617,11 +1663,13 @@ pub fn responder_handshake_resp<K: Kem>(
     leaf_data.extend_from_slice(&cid_digest(&quorum_cid));
     let expected_leaf = h256(&leaf_data);
     if expected_leaf != vkd.inclusion_hash {
+        puzzles.record_failure(puzzle_id);
         jitter_pre_auth();
         return Err(HandshakeError::Generic);
     }
     let prior_sth = last_verified_sth.cloned();
     if verify_vkd_proof(vkd, trust_anchors, prior_sth).is_none() {
+        puzzles.record_failure(puzzle_id);
         jitter_pre_auth();
         return Err(HandshakeError::DirectoryRollback);
     }
@@ -1642,12 +1690,14 @@ pub fn responder_handshake_resp<K: Kem>(
         cookie: m1.cookie.as_ref(),
     });
     if bind != m1.transcript_bind {
+        puzzles.record_failure(puzzle_id);
         jitter_pre_auth();
         return Err(HandshakeError::Generic);
     }
 
     let sid = session_id_from_bind(&bind);
     if replay.replay_seen_and_mark(&sid) {
+        puzzles.record_failure(puzzle_id);
         jitter_pre_auth();
         return Err(HandshakeError::Replay);
     }
@@ -1660,6 +1710,7 @@ pub fn responder_handshake_resp<K: Kem>(
         &m1.spend.quorum_sig,
         m1.spend.quorum_epoch,
     ) {
+        puzzles.record_failure(puzzle_id);
         jitter_pre_auth();
         return Err(HandshakeError::TokenUsed);
     }
@@ -1667,17 +1718,26 @@ pub fn responder_handshake_resp<K: Kem>(
     let ie = X25519Public::from(m1.eph_x25519_pub);
     let mut ss_dh = st.x25519_prekey_sk.diffie_hellman(&ie);
     if ss_dh.as_bytes().ct_eq(&[0u8; 32]).into() {
+        puzzles.record_failure(puzzle_id);
         jitter_pre_auth();
         return Err(HandshakeError::Generic);
     }
-    let kem_ct = K::deserialize_ct(&m1.kem_ciphertext).map_err(|_| {
-        jitter_pre_auth();
-        HandshakeError::Generic
-    })?;
-    let ss_kem = K::decapsulate(&kem_ct, &st.kem_sk).map_err(|_| {
-        jitter_pre_auth();
-        HandshakeError::Generic
-    })?;
+    let kem_ct = match K::deserialize_ct(&m1.kem_ciphertext) {
+        Ok(ct) => ct,
+        Err(_) => {
+            puzzles.record_failure(puzzle_id);
+            jitter_pre_auth();
+            return Err(HandshakeError::Generic);
+        }
+    };
+    let ss_kem = match K::decapsulate(&kem_ct, &st.kem_sk) {
+        Ok(ss) => ss,
+        Err(_) => {
+            puzzles.record_failure(puzzle_id);
+            jitter_pre_auth();
+            return Err(HandshakeError::Generic);
+        }
+    };
     let hybrid = derive_hybrid_secret(ss_dh.as_bytes(), ss_kem.as_ref());
     drop(ss_kem);
     ss_dh.zeroize();
@@ -1689,33 +1749,46 @@ pub fn responder_handshake_resp<K: Kem>(
     let er_pub = X25519Public::from(&er_sk);
     let mut s_add = er_sk.diffie_hellman(&ie);
     if s_add.as_bytes().ct_eq(&[0u8; 32]).into() {
+        puzzles.record_failure(puzzle_id);
         jitter_pre_auth();
         return Err(HandshakeError::Generic);
     }
     let mut rng = OsRng;
     let mut sr = [0u8; 32];
-    rng.try_fill_bytes(&mut sr).map_err(|_| {
+    if rng.try_fill_bytes(&mut sr).is_err() {
+        puzzles.record_failure(puzzle_id);
         jitter_pre_auth();
-        HandshakeError::Generic
-    })?;
+        return Err(HandshakeError::Generic);
+    }
 
     let n2 = Zeroizing::new(hkdf_n12(&s0.handshake_hash, &[ROLE_R, 2]));
     let aad = proto_aad(ROLE_R, &bind);
     let er_bytes = er_pub.to_bytes();
-    let msg = encode_resp_ok(&bind, &er_bytes, &sr).map_err(|_| {
-        jitter_pre_auth();
-        HandshakeError::Generic
-    })?;
-    let ct = aead_encrypt(&s0.aead_r_key_bytes, &n2, aad.as_ref(), &msg).map_err(|_| {
-        jitter_pre_auth();
-        HandshakeError::Generic
-    })?;
+    let msg = match encode_resp_ok(&bind, &er_bytes, &sr) {
+        Ok(msg) => msg,
+        Err(_) => {
+            puzzles.record_failure(puzzle_id);
+            jitter_pre_auth();
+            return Err(HandshakeError::Generic);
+        }
+    };
+    let ct = match aead_encrypt(&s0.aead_r_key_bytes, &n2, aad.as_ref(), &msg) {
+        Ok(ct) => ct,
+        Err(_) => {
+            puzzles.record_failure(puzzle_id);
+            jitter_pre_auth();
+            return Err(HandshakeError::Generic);
+        }
+    };
 
     let sf = derive_final_session(&s0, s_add.as_bytes(), &sr);
     s_add.zeroize();
 
     sr.zeroize();
     drop(s_add);
+
+    replay.cookie_mark_spent(&cookie.mac, cookie.ts);
+    puzzles.record_success(puzzle_id);
 
     Ok((
         HandshakeResp {
@@ -2657,19 +2730,63 @@ mod tests {
     use crate::vkd::cache::{ProofProcessingResult, ProofQueue};
     use libp2p_identity::{Keypair, PeerId};
     use proptest::prelude::*;
-    use std::collections::HashSet;
+    use std::collections::{hash_map::Entry, HashMap, HashSet};
     use std::fs::{self, File};
     use std::io::{Read, Write};
     use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::tempdir;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CookieStatus {
+        Pending,
+        Spent,
+    }
+
+    impl CookieStatus {
+        fn as_byte(self) -> u8 {
+            match self {
+                CookieStatus::Pending => 0,
+                CookieStatus::Spent => 1,
+            }
+        }
+
+        fn from_byte(byte: u8) -> Self {
+            if byte == 1 {
+                CookieStatus::Spent
+            } else {
+                CookieStatus::Pending
+            }
+        }
+    }
+
     #[derive(Default)]
-    struct TestReplay(Mutex<HashSet<[u8; 32]>>);
+    struct TestReplay {
+        sessions: Mutex<HashSet<[u8; 32]>>,
+        cookies: Mutex<HashMap<([u8; 32], u64), CookieStatus>>,
+    }
     impl ReplayCache for TestReplay {
         fn replay_seen_and_mark(&self, session_id: &[u8; 32]) -> bool {
-            let mut g = self.0.lock().unwrap();
+            let mut g = self.sessions.lock().unwrap();
             !g.insert(*session_id)
+        }
+
+        fn cookie_mark_attempt(&self, mac: &[u8; 32], ts: u64) -> bool {
+            let key = (*mac, ts);
+            let mut cookies = self.cookies.lock().unwrap();
+            if let Some(state) = cookies.get_mut(&key) {
+                *state = CookieStatus::Pending;
+                true
+            } else {
+                cookies.insert(key, CookieStatus::Pending);
+                false
+            }
+        }
+
+        fn cookie_mark_spent(&self, mac: &[u8; 32], ts: u64) {
+            let key = (*mac, ts);
+            let mut cookies = self.cookies.lock().unwrap();
+            cookies.insert(key, CookieStatus::Spent);
         }
     }
 
@@ -2702,7 +2819,7 @@ mod tests {
         fn new(path: PathBuf) -> Self {
             Self { path }
         }
-        fn load(&self) -> HashSet<[u8; 32]> {
+        fn load_sessions(&self) -> HashSet<[u8; 32]> {
             let mut set = HashSet::new();
             if let Ok(mut f) = File::open(&self.path) {
                 let mut buf = Vec::new();
@@ -2715,7 +2832,7 @@ mod tests {
             }
             set
         }
-        fn store(&self, set: &HashSet<[u8; 32]>) {
+        fn store_sessions(&self, set: &HashSet<[u8; 32]>) {
             let tmp = self.path.with_extension("tmp");
             let mut f = File::create(&tmp).unwrap();
             for id in set {
@@ -2727,16 +2844,71 @@ mod tests {
                 File::open(parent).unwrap().sync_all().unwrap();
             }
         }
+        fn cookie_path(&self) -> PathBuf {
+            let mut path = self.path.clone();
+            path.set_extension("cookie.bin");
+            path
+        }
+        fn load_cookies(&self) -> HashMap<([u8; 32], u64), CookieStatus> {
+            let mut map = HashMap::new();
+            let path = self.cookie_path();
+            if let Ok(mut f) = File::open(&path) {
+                let mut buf = Vec::new();
+                let _ = f.read_to_end(&mut buf);
+                for chunk in buf.chunks_exact(41) {
+                    let mut mac = [0u8; 32];
+                    mac.copy_from_slice(&chunk[..32]);
+                    let mut ts_bytes = [0u8; 8];
+                    ts_bytes.copy_from_slice(&chunk[32..40]);
+                    let ts = u64::from_le_bytes(ts_bytes);
+                    let state = CookieStatus::from_byte(chunk[40]);
+                    map.insert((mac, ts), state);
+                }
+            }
+            map
+        }
+        fn store_cookies(&self, map: &HashMap<([u8; 32], u64), CookieStatus>) {
+            let path = self.cookie_path();
+            let tmp = path.with_extension("tmp");
+            let mut f = File::create(&tmp).unwrap();
+            for ((mac, ts), state) in map {
+                f.write_all(mac).unwrap();
+                f.write_all(&ts.to_le_bytes()).unwrap();
+                f.write_all(&[state.as_byte()]).unwrap();
+            }
+            f.sync_all().unwrap();
+            fs::rename(&tmp, &path).unwrap();
+            if let Some(parent) = path.parent() {
+                File::open(parent).unwrap().sync_all().unwrap();
+            }
+        }
     }
     impl ReplayCache for FileReplay {
         fn replay_seen_and_mark(&self, session_id: &[u8; 32]) -> bool {
-            let mut set = self.load();
+            let mut set = self.load_sessions();
             if !set.insert(*session_id) {
                 true
             } else {
-                self.store(&set);
+                self.store_sessions(&set);
                 false
             }
+        }
+        fn cookie_mark_attempt(&self, mac: &[u8; 32], ts: u64) -> bool {
+            let mut map = self.load_cookies();
+            match map.entry((*mac, ts)) {
+                Entry::Occupied(_) => true,
+                Entry::Vacant(entry) => {
+                    entry.insert(CookieStatus::Pending);
+                    self.store_cookies(&map);
+                    false
+                }
+            }
+        }
+
+        fn cookie_mark_spent(&self, mac: &[u8; 32], ts: u64) {
+            let mut map = self.load_cookies();
+            map.insert((*mac, ts), CookieStatus::Spent);
+            self.store_cookies(&map);
         }
     }
 
@@ -3613,6 +3785,261 @@ mod tests {
     }
 
     #[test]
+    fn responder_rejects_replayed_cookie() {
+        let (record, mut bob_state) = generate_directory_record::<MlKem1024>(
+            b"did:example".to_vec(),
+            1,
+            sample_quorum_desc(1),
+        )
+        .unwrap();
+        let spend = make_receipt(record.prekey_batch_root);
+        let replay = TestReplay::default();
+        let verifier = TestSpendVerifier::default();
+        let server_secret = [5u8; 32];
+        let mut schedule = KeySchedule::new(2, 3, u64::MAX);
+        schedule.rotate(&server_secret, COOKIE_FMT_V1, 0);
+        let mut puzzles = AdaptivePuzzleDifficulty::new(4, 8);
+        let mut rate_limiter = RateLimiter::unlimited();
+
+        let vkd_keys = TestVkdKeys::single_witness();
+        let vkd = make_vkd_proof(&record, &vkd_keys);
+        let (m1, mut alice_state) =
+            initiator_handshake_init::<MlKem1024>(&record, spend.clone(), None, vkd).unwrap();
+
+        let keys = schedule.active_keys(1_000_000);
+        let retry = match responder_handshake_resp::<MlKem1024>(
+            ResponderEnv {
+                keys: &keys,
+                threshold: schedule.threshold(),
+                now_ts: 1_000_000,
+                ttl_secs: 300,
+                remote_ip: None,
+                peer_id: None,
+                puzzle_id: "client1",
+                puzzles: &mut puzzles,
+                rate_limiter: &mut rate_limiter,
+                replay: &replay,
+                spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
+                last_verified_sth: None,
+            },
+            ResponderSession {
+                message: &m1,
+                directory: &record,
+                state: &mut bob_state,
+            },
+        ) {
+            Err(HandshakeError::Retry(cookie)) => cookie,
+            Err(other) => panic!("expected retry to mint cookie, got error: {other:?}"),
+            Ok(_) => panic!("expected retry to mint cookie"),
+        };
+
+        let mut solved = retry.clone();
+        solved.nonce = solve_puzzle(&solved.puzzle);
+        let solved_cookie = solved.clone();
+        let mut m1_retry = m1.clone();
+        m1_retry.cookie = Some(solved);
+        let quorum_digest = hash_quorum_descriptor(&record.quorum_desc).unwrap();
+        m1_retry.transcript_bind = compute_transcript_bind_v2(TranscriptBindContext {
+            eph_x25519_pub: &m1_retry.eph_x25519_pub,
+            x25519_prekey: &record.x25519_prekey,
+            kem_ciphertext: &m1_retry.kem_ciphertext,
+            did: &m1_retry.did,
+            epoch: m1_retry.epoch,
+            prekey_batch_root: &m1_retry.prekey_batch_root,
+            spend: &m1_retry.spend,
+            sth_cid: &m1_retry.sth_cid,
+            bundle_cid: &m1_retry.bundle_cid,
+            quorum_desc_digest: &quorum_digest,
+            vkd: &m1_retry.vkd_proof,
+            pad: &m1_retry.pad,
+            cookie: m1_retry.cookie.as_ref(),
+        });
+        alice_state.transcript_bind = m1_retry.transcript_bind;
+
+        let keys = schedule.active_keys(1_000_010);
+        let mut first_state = bob_state.clone();
+        responder_handshake_resp::<MlKem1024>(
+            ResponderEnv {
+                keys: &keys,
+                threshold: schedule.threshold(),
+                now_ts: 1_000_010,
+                ttl_secs: 300,
+                remote_ip: None,
+                peer_id: None,
+                puzzle_id: "client1",
+                puzzles: &mut puzzles,
+                rate_limiter: &mut rate_limiter,
+                replay: &replay,
+                spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
+                last_verified_sth: None,
+            },
+            ResponderSession {
+                message: &m1_retry,
+                directory: &record,
+                state: &mut first_state,
+            },
+        )
+        .expect("first use of cookie should succeed");
+
+        let before_reuse = puzzles.current("client1");
+        let mut second_state = bob_state.clone();
+        let keys = schedule.active_keys(1_000_020);
+        match responder_handshake_resp::<MlKem1024>(
+            ResponderEnv {
+                keys: &keys,
+                threshold: schedule.threshold(),
+                now_ts: 1_000_020,
+                ttl_secs: 300,
+                remote_ip: None,
+                peer_id: None,
+                puzzle_id: "client1",
+                puzzles: &mut puzzles,
+                rate_limiter: &mut rate_limiter,
+                replay: &replay,
+                spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
+                last_verified_sth: None,
+            },
+            ResponderSession {
+                message: &m1_retry,
+                directory: &record,
+                state: &mut second_state,
+            },
+        ) {
+            Err(HandshakeError::Retry(new_cookie)) => {
+                assert_ne!(
+                    new_cookie.mac, solved_cookie.mac,
+                    "replay must mint fresh cookie"
+                );
+                assert!(
+                    puzzles.current("client1") >= before_reuse,
+                    "reuse should not reduce difficulty"
+                );
+            }
+            Err(other) => panic!("reused cookie should be rejected early, got error: {other:?}"),
+            Ok(_) => panic!("reused cookie should not succeed"),
+        }
+    }
+
+    #[test]
+    fn tampered_retry_keeps_difficulty_elevated() {
+        let (record, mut bob_state) = generate_directory_record::<MlKem1024>(
+            b"did:example".to_vec(),
+            1,
+            sample_quorum_desc(1),
+        )
+        .unwrap();
+        let spend = make_receipt(record.prekey_batch_root);
+        let replay = TestReplay::default();
+        let verifier = TestSpendVerifier::default();
+        let server_secret = [17u8; 32];
+        let mut schedule = KeySchedule::new(2, 3, u64::MAX);
+        schedule.rotate(&server_secret, COOKIE_FMT_V1, 0);
+        let mut puzzles = AdaptivePuzzleDifficulty::new(4, 8);
+        let mut rate_limiter = RateLimiter::unlimited();
+
+        let vkd_keys = TestVkdKeys::single_witness();
+        let vkd = make_vkd_proof(&record, &vkd_keys);
+        let (m1, _) = initiator_handshake_init::<MlKem1024>(&record, spend, None, vkd).unwrap();
+
+        let keys = schedule.active_keys(2_000_000);
+        let retry = match responder_handshake_resp::<MlKem1024>(
+            ResponderEnv {
+                keys: &keys,
+                threshold: schedule.threshold(),
+                now_ts: 2_000_000,
+                ttl_secs: 300,
+                remote_ip: None,
+                peer_id: None,
+                puzzle_id: "client1",
+                puzzles: &mut puzzles,
+                rate_limiter: &mut rate_limiter,
+                replay: &replay,
+                spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
+                last_verified_sth: None,
+            },
+            ResponderSession {
+                message: &m1,
+                directory: &record,
+                state: &mut bob_state,
+            },
+        ) {
+            Err(HandshakeError::Retry(cookie)) => cookie,
+            Err(other) => panic!("expected retry to mint cookie, got error: {other:?}"),
+            Ok(_) => panic!("expected retry to mint cookie"),
+        };
+
+        let mut solved = retry.clone();
+        solved.nonce = solve_puzzle(&solved.puzzle);
+        let mut tampered = m1.clone();
+        tampered.cookie = Some(solved);
+        if let Some(first) = tampered.did.first_mut() {
+            *first ^= 0x01;
+        }
+        let quorum_digest = hash_quorum_descriptor(&record.quorum_desc).unwrap();
+        tampered.transcript_bind = compute_transcript_bind_v2(TranscriptBindContext {
+            eph_x25519_pub: &tampered.eph_x25519_pub,
+            x25519_prekey: &record.x25519_prekey,
+            kem_ciphertext: &tampered.kem_ciphertext,
+            did: &tampered.did,
+            epoch: tampered.epoch,
+            prekey_batch_root: &tampered.prekey_batch_root,
+            spend: &tampered.spend,
+            sth_cid: &tampered.sth_cid,
+            bundle_cid: &tampered.bundle_cid,
+            quorum_desc_digest: &quorum_digest,
+            vkd: &tampered.vkd_proof,
+            pad: &tampered.pad,
+            cookie: tampered.cookie.as_ref(),
+        });
+
+        let before = puzzles.current("client1");
+        let keys = schedule.active_keys(2_000_010);
+        let mut tampered_state = bob_state.clone();
+        match responder_handshake_resp::<MlKem1024>(
+            ResponderEnv {
+                keys: &keys,
+                threshold: schedule.threshold(),
+                now_ts: 2_000_010,
+                ttl_secs: 300,
+                remote_ip: None,
+                peer_id: None,
+                puzzle_id: "client1",
+                puzzles: &mut puzzles,
+                rate_limiter: &mut rate_limiter,
+                replay: &replay,
+                spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
+                last_verified_sth: None,
+            },
+            ResponderSession {
+                message: &tampered,
+                directory: &record,
+                state: &mut tampered_state,
+            },
+        ) {
+            Err(HandshakeError::Retry(new_cookie)) => {
+                assert_ne!(
+                    new_cookie.mac, retry.mac,
+                    "tampering should mint fresh cookie"
+                );
+            }
+            Err(HandshakeError::Generic) => {}
+            Err(other) => panic!("tampered retry should require a new token, got error: {other:?}"),
+            Ok(_) => panic!("tampered retry should not succeed"),
+        }
+        let after = puzzles.current("client1");
+        assert!(
+            after >= before,
+            "difficulty should not decrease after failure"
+        );
+        assert!(after > 4, "misbehavior must keep difficulty above base");
+    }
+
+    #[test]
     fn replay_and_spend_reject() {
         let (record, mut bob_state) = generate_directory_record::<MlKem1024>(
             b"did:example".to_vec(),
@@ -3705,31 +4132,41 @@ mod tests {
         .unwrap();
 
         let keys = schedule.active_keys(1_000_020);
-        assert!(matches!(
-            responder_handshake_resp::<MlKem1024>(
-                ResponderEnv {
-                    keys: &keys,
-                    threshold: schedule.threshold(),
-                    now_ts: 1_000_020,
-                    ttl_secs: 300,
-                    remote_ip: None,
-                    peer_id: None,
-                    puzzle_id: "client1",
-                    puzzles: &mut puzzles,
-                    rate_limiter: &mut rate_limiter,
-                    replay: &replay,
-                    spend_verifier: &verifier,
-                    trust_anchors: &vkd_keys.trust,
-                    last_verified_sth: None,
-                },
-                ResponderSession {
-                    message: &m1_retry,
-                    directory: &record,
-                    state: &mut bob_state,
-                }
-            ),
-            Err(HandshakeError::Replay)
-        ));
+        let before_replay = puzzles.current("client1");
+        match responder_handshake_resp::<MlKem1024>(
+            ResponderEnv {
+                keys: &keys,
+                threshold: schedule.threshold(),
+                now_ts: 1_000_020,
+                ttl_secs: 300,
+                remote_ip: None,
+                peer_id: None,
+                puzzle_id: "client1",
+                puzzles: &mut puzzles,
+                rate_limiter: &mut rate_limiter,
+                replay: &replay,
+                spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
+                last_verified_sth: None,
+            },
+            ResponderSession {
+                message: &m1_retry,
+                directory: &record,
+                state: &mut bob_state,
+            },
+        ) {
+            Err(HandshakeError::Retry(new_cookie)) => {
+                assert_ne!(new_cookie.mac, retry.mac, "reuse should mint new cookie");
+                assert!(
+                    puzzles.current("client1") >= before_replay,
+                    "reuse should not reduce difficulty"
+                );
+            }
+            Err(other) => {
+                panic!("reusing a solved cookie should demand a new token, got error: {other:?}")
+            }
+            Ok(_) => panic!("reused cookie should not succeed"),
+        }
 
         let vkd2 = make_vkd_proof(&record, &vkd_keys);
         let (m1b, _) =
