@@ -9,16 +9,17 @@ pub mod ipfs;
 use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::net::Ipv4Addr;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
-use blstrs::G2Projective;
+use blstrs::{G2Projective, Scalar};
 use futures::{
     future::{BoxFuture, Either},
     stream::FuturesUnordered,
     StreamExt,
 };
+use group::Group;
 use libp2p::{
     autonat,
     gossipsub::{
@@ -51,10 +52,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-use crate::vkd::{
-    default_sth_log_id, default_sth_log_public_key, default_sth_witness_public_keys,
-    default_sth_witness_threshold, verify_sth_announcement, SthAnnouncement, SthValidationError,
-};
+use crate::vkd::{verify_sth_announcement, SthAnnouncement, SthValidationError, VkdTrustAnchors};
 
 /// Re-export the request/response exchange primitives for consumers.
 pub use exchange::{
@@ -90,6 +88,7 @@ pub struct P2pConfig {
     pub bootstrap_quorum: Option<bootstrap::TrustedBootstrapQuorum>,
     pub gossip_validation: ValidationMode,
     pub enable_mdns: bool,
+    pub vkd_trust: Arc<VkdTrustAnchors>,
 }
 
 impl Default for P2pConfig {
@@ -98,6 +97,14 @@ impl Default for P2pConfig {
         listen.push(Protocol::Ip4(Ipv4Addr::UNSPECIFIED));
         listen.push(Protocol::Udp(0));
         listen.push(Protocol::QuicV1);
+        let default_trust = VkdTrustAnchors::new(
+            b"testlog".to_vec(),
+            G2Projective::generator() * Scalar::from(42u64),
+            vec![G2Projective::generator() * Scalar::from(43u64)],
+            1,
+            G2Projective::generator() * Scalar::from(42u64),
+        )
+        .expect("default VKD trust anchors");
         Self {
             keypair: None,
             listen_addresses: vec![listen],
@@ -106,6 +113,7 @@ impl Default for P2pConfig {
             bootstrap_quorum: None,
             gossip_validation: ValidationMode::Strict,
             enable_mdns: true,
+            vkd_trust: Arc::new(default_trust),
         }
     }
 }
@@ -167,6 +175,8 @@ impl P2pNode {
             info!(target: "p2p", %local_peer_id, "mDNS discovery disabled by configuration");
         }
 
+        let trust = Arc::clone(&config.vkd_trust);
+
         let mut swarm = build_swarm(&local_key, config.gossip_validation, enable_mdns)?;
 
         for addr in &config.listen_addresses {
@@ -184,6 +194,7 @@ impl P2pNode {
         let task_gossip = gossip_tx.clone();
         let task_exchange = exchange_tx.clone();
 
+        let task_trust = Arc::clone(&trust);
         let task = tokio::spawn(async move {
             run_swarm(
                 swarm,
@@ -193,6 +204,7 @@ impl P2pNode {
                 task_exchange,
                 local_peer_id,
                 bootstrap,
+                task_trust,
             )
             .await
         });
@@ -817,6 +829,7 @@ fn build_swarm(
     Ok(swarm)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_swarm(
     mut swarm: Swarm<NodeBehaviour>,
     mut command_rx: mpsc::Receiver<Command>,
@@ -825,6 +838,7 @@ async fn run_swarm(
     exchange_tx: broadcast::Sender<ExchangeEvent>,
     local_peer_id: PeerId,
     bootstrap: Vec<(PeerId, Multiaddr)>,
+    trust: Arc<VkdTrustAnchors>,
 ) -> Result<()> {
     let mut pending_get: HashMap<QueryId, oneshot::Sender<Result<Option<Vec<u8>>>>> =
         HashMap::new();
@@ -1100,7 +1114,7 @@ async fn run_swarm(
                     SwarmEvent::Behaviour(NodeEvent::Gossipsub(GossipsubEvent::Message { propagation_source, message_id, message })) => {
                         let topic = message.topic.to_string();
                         let (acceptance, deliver) = if topic == VKD_STH_TOPIC {
-                            match validate_sth_gossip(&message.data) {
+                            match validate_sth_gossip(&message.data, trust.as_ref()) {
                                 Ok(_) => (MessageAcceptance::Accept, true),
                                 Err(error) => {
                                     warn!(
@@ -1557,36 +1571,13 @@ enum SthGossipError {
     Validation(#[from] SthValidationError),
 }
 
-fn validate_sth_gossip(data: &[u8]) -> Result<SthAnnouncement, SthGossipError> {
+fn validate_sth_gossip(
+    data: &[u8],
+    trust: &VkdTrustAnchors,
+) -> Result<SthAnnouncement, SthGossipError> {
     let announcement: SthAnnouncement = serde_cbor::from_slice(data)?;
-    verify_sth_announcement(
-        &announcement,
-        sth_log_id(),
-        sth_log_pk(),
-        sth_witness_pks(),
-        sth_witness_threshold(),
-    )?;
+    verify_sth_announcement(&announcement, trust)?;
     Ok(announcement)
-}
-
-fn sth_log_pk() -> &'static G2Projective {
-    static LOG_PK: OnceLock<G2Projective> = OnceLock::new();
-    LOG_PK.get_or_init(default_sth_log_public_key)
-}
-
-fn sth_witness_pks() -> &'static [G2Projective] {
-    static WITNESS_PKS: OnceLock<Vec<G2Projective>> = OnceLock::new();
-    WITNESS_PKS
-        .get_or_init(default_sth_witness_public_keys)
-        .as_slice()
-}
-
-fn sth_witness_threshold() -> usize {
-    default_sth_witness_threshold()
-}
-
-fn sth_log_id() -> &'static [u8] {
-    default_sth_log_id()
 }
 
 #[cfg(test)]
@@ -1596,11 +1587,10 @@ mod tests {
     use crate::quorum::{bls_sign, SIG_DST};
     use crate::{
         generate_directory_record, DirectoryRecord, HandshakeInit, HandshakeResp, MlKem1024,
-        VkdProof,
+        TestVkdKeys, VkdProof,
     };
     use anyhow::anyhow;
     use async_trait::async_trait;
-    use blstrs::Scalar;
     use group::Curve;
     use libipld::prelude::Codec;
     use libipld::{
@@ -1623,8 +1613,13 @@ mod tests {
     };
     use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, task::JoinHandle};
 
-    fn build_valid_sth_message() -> Vec<u8> {
-        let log_id = default_sth_log_id().to_vec();
+    fn sample_keys() -> TestVkdKeys {
+        TestVkdKeys::single_witness()
+    }
+
+    fn build_valid_sth_message(keys: &TestVkdKeys) -> Vec<u8> {
+        let trust = &keys.trust;
+        let log_id = trust.log_id().to_vec();
         let root_hash = [11u8; 32];
         let tree_size = 6u64;
         let sth_time = 13u64;
@@ -1635,13 +1630,15 @@ mod tests {
         tuple.extend_from_slice(&sth_time.to_le_bytes());
         tuple.extend_from_slice(&log_id);
 
-        let log_sk = Scalar::from(42u64);
-        let witness_sk = Scalar::from(43u64);
-        let log_sig = bls_sign(&log_sk, &tuple, SIG_DST)
+        let log_sig = bls_sign(&keys.log_sk, &tuple, SIG_DST)
             .to_affine()
             .to_compressed()
             .to_vec();
-        let witness_sig = bls_sign(&witness_sk, &tuple, SIG_DST)
+        let witness_sk = keys
+            .witness_sks
+            .first()
+            .expect("at least one witness secret key");
+        let witness_sig = bls_sign(witness_sk, &tuple, SIG_DST)
             .to_affine()
             .to_compressed()
             .to_vec();
@@ -1664,13 +1661,15 @@ mod tests {
 
     #[test]
     fn sth_validation_accepts_valid_payload() {
-        let data = build_valid_sth_message();
-        assert!(validate_sth_gossip(&data).is_ok());
+        let keys = sample_keys();
+        let data = build_valid_sth_message(&keys);
+        assert!(validate_sth_gossip(&data, &keys.trust).is_ok());
     }
 
     #[test]
     fn sth_validation_rejects_tampered_signature() {
-        let mut data = build_valid_sth_message();
+        let keys = sample_keys();
+        let mut data = build_valid_sth_message(&keys);
         let mut announcement: SthAnnouncement =
             serde_cbor::from_slice(&data).expect("decode sth announcement");
         if let Some(byte) = announcement.log_signature.first_mut() {
@@ -1678,7 +1677,7 @@ mod tests {
         }
         data = serde_cbor::to_vec(&announcement).expect("re-encode tampered announcement");
 
-        match validate_sth_gossip(&data) {
+        match validate_sth_gossip(&data, &keys.trust) {
             Err(SthGossipError::Validation(error)) => {
                 assert!(matches!(
                     error,
@@ -1707,9 +1706,12 @@ mod tests {
 
     async fn spawn_connected_pair() -> Result<(P2pNode, P2pNode)> {
         let listen_addr: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse()?;
+        let keys = sample_keys();
+        let trust_arc = Arc::new(keys.trust.clone());
         let node_a_config = P2pConfig {
             listen_addresses: vec![listen_addr.clone()],
             enable_mdns: false,
+            vkd_trust: Arc::clone(&trust_arc),
             ..P2pConfig::default()
         };
         let node_a = P2pNode::run(node_a_config).await?;
@@ -1719,6 +1721,7 @@ mod tests {
             listen_addresses: vec![listen_addr],
             enable_mdns: false,
             bootstrap_peers: node_a_bootstrap.clone(),
+            vkd_trust: Arc::clone(&trust_arc),
             ..P2pConfig::default()
         };
         let node_b = P2pNode::run(node_b_config).await?;
@@ -1747,10 +1750,13 @@ mod tests {
             } else {
                 Vec::new()
             };
+            let keys = sample_keys();
+            let trust_arc = Arc::new(keys.trust);
             let config = P2pConfig {
                 listen_addresses: vec![listen_addr],
                 enable_mdns: false,
                 bootstrap_peers,
+                vkd_trust: Arc::clone(&trust_arc),
                 ..P2pConfig::default()
             };
 
@@ -1893,7 +1899,8 @@ mod tests {
         )
         .expect("generate record");
         let spend = crate::make_receipt(record.prekey_batch_root);
-        let vkd = crate::make_vkd_proof(&record);
+        let keys = TestVkdKeys::single_witness();
+        let vkd = crate::make_vkd_proof(&record, &keys);
         let (init, _) =
             crate::initiator_handshake_init::<crate::MlKem1024>(&record, spend, None, vkd)
                 .expect("handshake init");

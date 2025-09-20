@@ -2,8 +2,12 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
-use blstrs::{G1Affine, G1Projective, G2Projective, Scalar};
-use group::{prime::PrimeCurveAffine, Group};
+use blstrs::{G1Affine, G1Projective};
+#[cfg(test)]
+use blstrs::{G2Projective, Scalar};
+use group::prime::PrimeCurveAffine;
+#[cfg(test)]
+use group::Group;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand_core_06::{OsRng, RngCore as _};
@@ -33,6 +37,7 @@ use crate::directory::MerkleProof;
 use crate::net::ratelimit::RateLimiter;
 use crate::quorum::{bls_verify, QuorumDescriptor, SIG_DST};
 use crate::security::audit::{ServerSecretShare, SharedSecret};
+use crate::vkd::VkdTrustAnchors;
 
 /// Directory snapshot encoding, verification, and transparency log helpers.
 pub mod directory;
@@ -70,38 +75,10 @@ const WIRE_VER: u8 = 1;
 const ROLE_I: u8 = 0x49;
 const ROLE_R: u8 = 0x52;
 
-const VKD_LOG_ID: &[u8] = b"testlog";
-
-fn vkd_log_pk() -> G2Projective {
-    G2Projective::generator() * Scalar::from(42u64)
-}
-
-fn vkd_witness_pks() -> Vec<G2Projective> {
-    vec![G2Projective::generator() * Scalar::from(43u64)]
-}
-
-fn vkd_witness_threshold() -> usize {
-    1
-}
-
-fn vkd_vrf_pk() -> G2Projective {
-    vkd_log_pk()
-}
-
 fn jitter_pre_auth() {
     let mut rng = OsRng;
     let delay = 3 + (rng.next_u32() % 5) as u64;
     thread::sleep(Duration::from_millis(delay));
-}
-
-#[cfg(test)]
-fn vkd_log_sk() -> Scalar {
-    Scalar::from(42u64)
-}
-
-#[cfg(test)]
-fn vkd_witness_sk() -> Scalar {
-    Scalar::from(43u64)
 }
 
 /// Errors encountered when performing cryptographic operations.
@@ -575,14 +552,10 @@ pub struct VerifiedSth {
 /// Validates inclusion, witness, and VRF proofs for a directory record update.
 pub fn verify_vkd_proof(
     proof: &VkdProof,
-    expected_log_id: &[u8],
-    log_pk: &G2Projective,
-    witness_pks: &[G2Projective],
-    witness_threshold: usize,
-    vrf_pk: &G2Projective,
+    trust: &VkdTrustAnchors,
     prev_sth: Option<VerifiedSth>,
 ) -> Option<VerifiedSth> {
-    if proof.log_id != expected_log_id {
+    if proof.log_id != trust.log_id() {
         return None;
     }
 
@@ -604,14 +577,14 @@ pub fn verify_vkd_proof(
     }
 
     let sth_sig = g1_from_bytes(&proof.sth_sig)?;
-    if !bls_verify(log_pk, &sth_tuple, &sth_sig, SIG_DST) {
+    if !bls_verify(trust.log_public_key(), &sth_tuple, &sth_sig, SIG_DST) {
         return None;
     }
 
     let mut matched = HashSet::new();
     for sig_bytes in &proof.witness_sigs {
         if let Some(sig) = g1_from_bytes(sig_bytes) {
-            for (i, pk) in witness_pks.iter().enumerate() {
+            for (i, pk) in trust.witness_public_keys().iter().enumerate() {
                 if !matched.contains(&i) && bls_verify(pk, &sth_tuple, &sig, SIG_DST) {
                     matched.insert(i);
                     break;
@@ -619,7 +592,7 @@ pub fn verify_vkd_proof(
             }
         }
     }
-    if matched.len() < witness_threshold {
+    if matched.len() < trust.witness_threshold() {
         return None;
     }
 
@@ -643,7 +616,12 @@ pub fn verify_vkd_proof(
     }
 
     let vrf_sig = g1_from_bytes(&proof.vrf_proof)?;
-    if !bls_verify(vrf_pk, &proof.inclusion_hash, &vrf_sig, SIG_DST) {
+    if !bls_verify(
+        trust.vrf_public_key(),
+        &proof.inclusion_hash,
+        &vrf_sig,
+        SIG_DST,
+    ) {
         return None;
     }
 
@@ -1462,6 +1440,7 @@ pub struct ResponderEnv<'a> {
     pub rate_limiter: &'a mut RateLimiter,
     pub replay: &'a dyn ReplayCache,
     pub spend_verifier: &'a dyn SpendVerifier,
+    pub trust_anchors: &'a VkdTrustAnchors,
 }
 
 /// Responder-owned context tying together message, directory entry, and secrets.
@@ -1487,6 +1466,7 @@ pub fn responder_handshake_resp<K: Kem>(
         rate_limiter,
         replay,
         spend_verifier,
+        trust_anchors,
     } = env;
     let ResponderSession {
         message: m1,
@@ -1595,18 +1575,7 @@ pub fn responder_handshake_resp<K: Kem>(
         jitter_pre_auth();
         return Err(HandshakeError::Generic);
     }
-    let wits = vkd_witness_pks();
-    if verify_vkd_proof(
-        vkd,
-        VKD_LOG_ID,
-        &vkd_log_pk(),
-        &wits,
-        vkd_witness_threshold(),
-        &vkd_vrf_pk(),
-        None,
-    )
-    .is_none()
-    {
+    if verify_vkd_proof(vkd, trust_anchors, None).is_none() {
         jitter_pre_auth();
         return Err(HandshakeError::Generic);
     }
@@ -2490,6 +2459,33 @@ pub(crate) fn make_receipt(root: [u8; 32]) -> SpendReceipt {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestVkdKeys {
+    pub trust: VkdTrustAnchors,
+    pub log_sk: Scalar,
+    pub witness_sks: Vec<Scalar>,
+    pub vrf_sk: Scalar,
+}
+
+#[cfg(test)]
+impl TestVkdKeys {
+    pub fn single_witness() -> Self {
+        let log_sk = Scalar::from(42u64);
+        let witness_sk = Scalar::from(43u64);
+        let log_pk = G2Projective::generator() * log_sk;
+        let witness_pk = G2Projective::generator() * witness_sk;
+        let trust = VkdTrustAnchors::new(b"testlog".to_vec(), log_pk, vec![witness_pk], 1, log_pk)
+            .expect("valid VKD trust anchors");
+        Self {
+            trust,
+            log_sk,
+            witness_sks: vec![witness_sk],
+            vrf_sk: log_sk,
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn sample_quorum_desc(epoch: u64) -> QuorumDescriptor {
     QuorumDescriptor {
         sig_algo: "BLS12381G1_XMD:SHA-256_SSWU_RO".to_string(),
@@ -2499,7 +2495,7 @@ pub(crate) fn sample_quorum_desc(epoch: u64) -> QuorumDescriptor {
 }
 
 #[cfg(test)]
-pub(crate) fn make_vkd_proof<K: Kem>(record: &DirectoryRecord<K>) -> VkdProof {
+pub(crate) fn make_vkd_proof<K: Kem>(record: &DirectoryRecord<K>, keys: &TestVkdKeys) -> VkdProof {
     use crate::directory::TransparencyLog;
     use crate::quorum::bls_sign;
     use group::Curve;
@@ -2526,26 +2522,37 @@ pub(crate) fn make_vkd_proof<K: Kem>(record: &DirectoryRecord<K>) -> VkdProof {
     sth_tuple.extend_from_slice(&root);
     sth_tuple.extend_from_slice(&tree_size.to_le_bytes());
     sth_tuple.extend_from_slice(&sth_time.to_le_bytes());
-    sth_tuple.extend_from_slice(VKD_LOG_ID);
-    let sth_sig = bls_sign(&vkd_log_sk(), &sth_tuple, SIG_DST)
+    sth_tuple.extend_from_slice(keys.trust.log_id());
+    let sth_sig = bls_sign(&keys.log_sk, &sth_tuple, SIG_DST)
         .to_affine()
         .to_compressed()
         .to_vec();
-    let wit_sig = bls_sign(&vkd_witness_sk(), &sth_tuple, SIG_DST)
-        .to_affine()
-        .to_compressed()
-        .to_vec();
-    let vrf_sig = bls_sign(&vkd_log_sk(), &leaf, SIG_DST)
+    assert_eq!(
+        keys.witness_sks.len(),
+        keys.trust.witness_public_keys().len(),
+        "witness secret keys must match trust anchors",
+    );
+    let witness_sigs: Vec<Vec<u8>> = keys
+        .witness_sks
+        .iter()
+        .map(|sk| {
+            bls_sign(sk, &sth_tuple, SIG_DST)
+                .to_affine()
+                .to_compressed()
+                .to_vec()
+        })
+        .collect();
+    let vrf_sig = bls_sign(&keys.vrf_sk, &leaf, SIG_DST)
         .to_affine()
         .to_compressed()
         .to_vec();
     VkdProof {
-        log_id: VKD_LOG_ID.to_vec(),
+        log_id: keys.trust.log_id().to_vec(),
         sth_root_hash: root,
         sth_tree_size: tree_size,
         sth_time,
         sth_sig,
-        witness_sigs: vec![wit_sig],
+        witness_sigs,
         inclusion_hash: leaf,
         inclusion_proof: proof,
         consistency_proof: None,
@@ -2579,7 +2586,6 @@ mod tests {
     use crate::net::ratelimit::{RateLimitParams, RateLimiter};
     use libp2p_identity::{Keypair, PeerId};
     use proptest::prelude::*;
-    use rand_core_06::OsRng;
     use std::collections::HashSet;
     use std::fs::{self, File};
     use std::io::{Read, Write};
@@ -2744,14 +2750,8 @@ mod tests {
     fn vkd_proof_verification() {
         use crate::directory::TransparencyLog;
         use crate::quorum::bls_sign;
-        use blstrs::{G2Projective, Scalar};
-        use ff::Field;
-        use group::{Curve, Group};
-        let mut rng = OsRng;
-        let log_sk = Scalar::random(&mut rng);
-        let log_pk = G2Projective::generator() * log_sk;
-        let wit_sk = Scalar::random(&mut rng);
-        let wit_pk = G2Projective::generator() * wit_sk;
+        use group::Curve;
+        let keys = TestVkdKeys::single_witness();
 
         let mut tlog = TransparencyLog::new();
         let leaf = [1u8; 32];
@@ -2761,29 +2761,28 @@ mod tests {
 
         let tree_size = 1u64;
         let sth_time = 42u64;
-        let log_id = b"testlog".to_vec();
         let mut sth_tuple = Vec::new();
         sth_tuple.extend_from_slice(&root);
         sth_tuple.extend_from_slice(&tree_size.to_le_bytes());
         sth_tuple.extend_from_slice(&sth_time.to_le_bytes());
-        sth_tuple.extend_from_slice(&log_id);
-        let sth_sig = bls_sign(&log_sk, &sth_tuple, SIG_DST)
+        sth_tuple.extend_from_slice(keys.trust.log_id());
+        let sth_sig = bls_sign(&keys.log_sk, &sth_tuple, SIG_DST)
             .to_affine()
             .to_compressed()
             .to_vec();
-        let wit_sig = bls_sign(&wit_sk, &sth_tuple, SIG_DST)
+        let wit_sig = bls_sign(&keys.witness_sks[0], &sth_tuple, SIG_DST)
             .to_affine()
             .to_compressed()
             .to_vec();
 
-        let vrf_sig = bls_sign(&log_sk, &leaf, SIG_DST)
+        let vrf_sig = bls_sign(&keys.vrf_sk, &leaf, SIG_DST)
             .to_affine()
             .to_compressed()
             .to_vec();
         let dummy_cid = cid_from_encoded(&[0xAA]);
 
         let vkd = VkdProof {
-            log_id: log_id.clone(),
+            log_id: keys.trust.log_id().to_vec(),
             sth_root_hash: root,
             sth_tree_size: tree_size,
             sth_time,
@@ -2797,8 +2796,70 @@ mod tests {
             quorum_desc_cid: dummy_cid,
         };
 
-        let verified = verify_vkd_proof(&vkd, &log_id, &log_pk, &[wit_pk], 1, &log_pk, None);
+        let verified = verify_vkd_proof(&vkd, &keys.trust, None);
         assert!(verified.is_some());
+    }
+
+    #[test]
+    fn vkd_proof_rejects_wrong_keys() {
+        use crate::directory::TransparencyLog;
+        use crate::quorum::bls_sign;
+        use group::Curve;
+        let keys = TestVkdKeys::single_witness();
+
+        let mut tlog = TransparencyLog::new();
+        let leaf = [2u8; 32];
+        tlog.append(leaf).expect("failed to append log leaf");
+        let root = tlog.root();
+        let proof = tlog.prove(0).unwrap();
+
+        let tree_size = 1u64;
+        let sth_time = 7u64;
+        let mut sth_tuple = Vec::new();
+        sth_tuple.extend_from_slice(&root);
+        sth_tuple.extend_from_slice(&tree_size.to_le_bytes());
+        sth_tuple.extend_from_slice(&sth_time.to_le_bytes());
+        sth_tuple.extend_from_slice(keys.trust.log_id());
+        let sth_sig = bls_sign(&keys.log_sk, &sth_tuple, SIG_DST)
+            .to_affine()
+            .to_compressed()
+            .to_vec();
+        let wit_sig = bls_sign(&keys.witness_sks[0], &sth_tuple, SIG_DST)
+            .to_affine()
+            .to_compressed()
+            .to_vec();
+
+        let vrf_sig = bls_sign(&keys.vrf_sk, &leaf, SIG_DST)
+            .to_affine()
+            .to_compressed()
+            .to_vec();
+        let dummy_cid = cid_from_encoded(&[0xBB]);
+
+        let vkd = VkdProof {
+            log_id: keys.trust.log_id().to_vec(),
+            sth_root_hash: root,
+            sth_tree_size: tree_size,
+            sth_time,
+            sth_sig,
+            witness_sigs: vec![wit_sig],
+            inclusion_hash: leaf,
+            inclusion_proof: proof,
+            consistency_proof: None,
+            vrf_proof: vrf_sig,
+            bundle_cid: dummy_cid,
+            quorum_desc_cid: dummy_cid,
+        };
+
+        let forged_trust = VkdTrustAnchors::new(
+            keys.trust.log_id().to_vec(),
+            G2Projective::generator() * Scalar::from(99u64),
+            keys.trust.witness_public_keys().to_vec(),
+            keys.trust.witness_threshold(),
+            G2Projective::generator() * Scalar::from(77u64),
+        )
+        .expect("forged trust");
+
+        assert!(verify_vkd_proof(&vkd, &forged_trust, None).is_none());
     }
 
     #[test]
@@ -2832,7 +2893,8 @@ mod tests {
         let mut puzzles = AdaptivePuzzleDifficulty::new(4, 8);
         let mut rate_limiter = RateLimiter::unlimited();
 
-        let vkd = make_vkd_proof(&record);
+        let vkd_keys = TestVkdKeys::single_witness();
+        let vkd = make_vkd_proof(&record, &vkd_keys);
         let (m1, mut alice_state) =
             initiator_handshake_init::<MlKem1024>(&record, spend.clone(), None, vkd).unwrap();
         let keys = schedule.active_keys(1_000_000);
@@ -2849,6 +2911,7 @@ mod tests {
                 rate_limiter: &mut rate_limiter,
                 replay: &replay,
                 spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
             },
             ResponderSession {
                 message: &m1,
@@ -2895,6 +2958,7 @@ mod tests {
                 rate_limiter: &mut rate_limiter,
                 replay: &replay,
                 spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
             },
             ResponderSession {
                 message: &m1_retry,
@@ -2975,7 +3039,8 @@ mod tests {
         let mut puzzles = AdaptivePuzzleDifficulty::new(4, 8);
         let mut rate_limiter = RateLimiter::unlimited();
 
-        let vkd = make_vkd_proof(&record);
+        let vkd_keys = TestVkdKeys::single_witness();
+        let vkd = make_vkd_proof(&record, &vkd_keys);
         let (m1, _) =
             initiator_handshake_init::<MlKem1024>(&record, spend.clone(), None, vkd).unwrap();
         let keys = schedule.active_keys(1_000_000);
@@ -2992,6 +3057,7 @@ mod tests {
                 rate_limiter: &mut rate_limiter,
                 replay: &replay,
                 spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
             },
             ResponderSession {
                 message: &m1,
@@ -3036,6 +3102,7 @@ mod tests {
                 rate_limiter: &mut rate_limiter,
                 replay: &replay,
                 spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
             },
             ResponderSession {
                 message: &m1_retry,
@@ -3060,6 +3127,7 @@ mod tests {
                     rate_limiter: &mut rate_limiter,
                     replay: &replay,
                     spend_verifier: &verifier,
+                    trust_anchors: &vkd_keys.trust,
                 },
                 ResponderSession {
                     message: &m1_retry,
@@ -3070,7 +3138,7 @@ mod tests {
             Err(HandshakeError::Replay)
         ));
 
-        let vkd2 = make_vkd_proof(&record);
+        let vkd2 = make_vkd_proof(&record, &vkd_keys);
         let (m1b, _) =
             initiator_handshake_init::<MlKem1024>(&record, spend.clone(), None, vkd2).unwrap();
         let keys = schedule.active_keys(1_000_030);
@@ -3087,6 +3155,7 @@ mod tests {
                 rate_limiter: &mut rate_limiter,
                 replay: &replay,
                 spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
             },
             ResponderSession {
                 message: &m1b,
@@ -3132,6 +3201,7 @@ mod tests {
                     rate_limiter: &mut rate_limiter,
                     replay: &replay,
                     spend_verifier: &verifier,
+                    trust_anchors: &vkd_keys.trust,
                 },
                 ResponderSession {
                     message: &m1b_retry,
@@ -3159,7 +3229,8 @@ mod tests {
         schedule.rotate(&server_secret, COOKIE_FMT_V1, 0);
         let mut puzzles = AdaptivePuzzleDifficulty::new(4, 8);
         let mut rate_limiter = RateLimiter::unlimited();
-        let vkd = make_vkd_proof(&record);
+        let vkd_keys = TestVkdKeys::single_witness();
+        let vkd = make_vkd_proof(&record, &vkd_keys);
         let (m1, _) =
             initiator_handshake_init::<MlKem1024>(&record, spend.clone(), None, vkd).unwrap();
         let keys = schedule.active_keys(1_000_000);
@@ -3176,6 +3247,7 @@ mod tests {
                 rate_limiter: &mut rate_limiter,
                 replay: &replay,
                 spend_verifier: &verifier,
+                trust_anchors: &vkd_keys.trust,
             },
             ResponderSession {
                 message: &m1,
@@ -3222,6 +3294,7 @@ mod tests {
                     rate_limiter: &mut rate_limiter,
                     replay: &replay,
                     spend_verifier: &verifier,
+                    trust_anchors: &vkd_keys.trust,
                 },
                 ResponderSession {
                     message: &m1_tamper,
@@ -3386,11 +3459,12 @@ mod tests {
             let ip = IpAddr::from(Ipv4Addr::new(198, 51, 100, 1));
             let peer = random_peer_id();
             let mut now = 1_000_000u64;
+            let vkd_keys = TestVkdKeys::single_witness();
 
             let mut throttled = false;
             for _ in 0..attacker_attempts {
                 let spend = make_receipt(record.prekey_batch_root);
-                let vkd = make_vkd_proof(&record);
+                let vkd = make_vkd_proof(&record, &vkd_keys);
                 let (mut m1, _) =
                 initiator_handshake_init::<MlKem1024>(&record, spend, None, vkd).unwrap();
 
@@ -3409,6 +3483,7 @@ mod tests {
                         rate_limiter: &mut rate_limiter,
                         replay: &replay,
                         spend_verifier: &verifier,
+                        trust_anchors: &vkd_keys.trust,
                     },
                     ResponderSession {
                         message: &m1,
@@ -3455,6 +3530,7 @@ mod tests {
                         rate_limiter: &mut rate_limiter,
                         replay: &replay,
                         spend_verifier: &verifier,
+                        trust_anchors: &vkd_keys.trust,
                     },
                     ResponderSession {
                         message: &m1,
@@ -3478,7 +3554,7 @@ mod tests {
 
             now += refill_secs.saturating_mul(2);
             let spend = make_receipt(record.prekey_batch_root);
-            let vkd = make_vkd_proof(&record);
+            let vkd = make_vkd_proof(&record, &vkd_keys);
             let (mut legit_m1, _) =
                 initiator_handshake_init::<MlKem1024>(&record, spend, None, vkd).unwrap();
             let keys = schedule.active_keys(now);
@@ -3496,6 +3572,7 @@ mod tests {
                     rate_limiter: &mut rate_limiter,
                     replay: &replay,
                     spend_verifier: &verifier,
+                    trust_anchors: &vkd_keys.trust,
                 },
                 ResponderSession {
                     message: &legit_m1,
@@ -3540,6 +3617,7 @@ mod tests {
                     rate_limiter: &mut rate_limiter,
                     replay: &replay,
                     spend_verifier: &verifier,
+                    trust_anchors: &vkd_keys.trust,
                 },
                 ResponderSession {
                     message: &legit_m1,

@@ -6,7 +6,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use blstrs::G2Projective;
 use libipld::{
     cbor::DagCborCodec,
     cid::Cid,
@@ -16,7 +15,11 @@ use libipld::{
 use multihash::{Code, MultihashDigest};
 use thiserror::Error;
 
+use crate::vkd::VkdTrustAnchors;
 use crate::{verify_vkd_proof, VerifiedSth, VkdProof};
+
+#[cfg(test)]
+use blstrs::G2Projective;
 
 /// Errors produced while persisting or validating queued VKD proofs.
 #[derive(Debug, Error)]
@@ -154,11 +157,7 @@ impl ProofQueue {
 
     pub fn process_pending(
         &self,
-        expected_log_id: &[u8],
-        log_pk: &G2Projective,
-        witness_pks: &[G2Projective],
-        witness_threshold: usize,
-        vrf_pk: &G2Projective,
+        trust: &VkdTrustAnchors,
     ) -> Result<Vec<ProofProcessingResult>, ProofQueueError> {
         let mut last_verified = self.load_last_verified()?;
         let mut results = Vec::new();
@@ -175,15 +174,7 @@ impl ProofQueue {
                 Err(other) => return Err(other),
             };
             let prev = last_verified.get(&proof.log_id).cloned();
-            match verify_vkd_proof(
-                &proof,
-                expected_log_id,
-                log_pk,
-                witness_pks,
-                witness_threshold,
-                vrf_pk,
-                prev,
-            ) {
+            match verify_vkd_proof(&proof, trust, prev) {
                 Some(verified) => {
                     let dest = self.accepted_path(&cid);
                     fs::rename(&path, &dest)
@@ -320,16 +311,23 @@ mod tests {
     use super::*;
     use crate::directory::TransparencyLog;
     use crate::quorum::{bls_sign, SIG_DST};
+    use crate::vkd::VkdTrustAnchors;
     use blstrs::Scalar;
     use group::{Curve, Group};
     use libipld::multihash::MultihashDigest;
     use tempfile::tempdir;
 
-    const LOG_ID: &[u8] = b"testlog";
-
-    fn sample_proof() -> VkdProof {
+    fn sample_trust() -> (VkdTrustAnchors, Scalar, Scalar) {
         let log_sk = Scalar::from(42u64);
         let witness_sk = Scalar::from(43u64);
+        let log_pk = G2Projective::generator() * log_sk;
+        let witness_pk = G2Projective::generator() * witness_sk;
+        let trust = VkdTrustAnchors::new(b"testlog".to_vec(), log_pk, vec![witness_pk], 1, log_pk)
+            .expect("valid trust anchors");
+        (trust, log_sk, witness_sk)
+    }
+
+    fn sample_proof(trust: &VkdTrustAnchors, log_sk: &Scalar, witness_sk: &Scalar) -> VkdProof {
         let leaf = [7u8; 32];
         let mut log = TransparencyLog::new();
         log.append(leaf).expect("append leaf");
@@ -342,17 +340,17 @@ mod tests {
         tuple.extend_from_slice(&root);
         tuple.extend_from_slice(&tree_size.to_le_bytes());
         tuple.extend_from_slice(&sth_time.to_le_bytes());
-        tuple.extend_from_slice(LOG_ID);
+        tuple.extend_from_slice(trust.log_id());
 
-        let sth_sig = bls_sign(&log_sk, &tuple, SIG_DST)
+        let sth_sig = bls_sign(log_sk, &tuple, SIG_DST)
             .to_affine()
             .to_compressed()
             .to_vec();
-        let witness_sig = bls_sign(&witness_sk, &tuple, SIG_DST)
+        let witness_sig = bls_sign(witness_sk, &tuple, SIG_DST)
             .to_affine()
             .to_compressed()
             .to_vec();
-        let vrf_sig = bls_sign(&log_sk, &leaf, SIG_DST)
+        let vrf_sig = bls_sign(log_sk, &leaf, SIG_DST)
             .to_affine()
             .to_compressed()
             .to_vec();
@@ -362,7 +360,7 @@ mod tests {
             Cid::new_v1(u64::from(DagCborCodec), Code::Sha2_256.digest(b"quorum"));
 
         VkdProof {
-            log_id: LOG_ID.to_vec(),
+            log_id: trust.log_id().to_vec(),
             sth_root_hash: root,
             sth_tree_size: tree_size,
             sth_time,
@@ -377,17 +375,12 @@ mod tests {
         }
     }
 
-    fn verifier_params() -> (G2Projective, Vec<G2Projective>, usize) {
-        let log_pk = G2Projective::generator() * Scalar::from(42u64);
-        let witness_pk = G2Projective::generator() * Scalar::from(43u64);
-        (log_pk, vec![witness_pk], 1)
-    }
-
     #[test]
     fn enqueue_rejects_duplicates() {
         let temp = tempdir().expect("tempdir");
         let queue = ProofQueue::new(temp.path()).expect("queue");
-        let proof = sample_proof();
+        let (trust, log_sk, witness_sk) = sample_trust();
+        let proof = sample_proof(&trust, &log_sk, &witness_sk);
         let cid = queue.enqueue(&proof).expect("enqueue");
         let pending = temp.path().join("pending").join(cid.to_string());
         assert!(pending.exists());
@@ -399,12 +392,10 @@ mod tests {
     fn process_moves_verified_proofs() {
         let temp = tempdir().expect("tempdir");
         let queue = ProofQueue::new(temp.path()).expect("queue");
-        let proof = sample_proof();
+        let (trust, log_sk, witness_sk) = sample_trust();
+        let proof = sample_proof(&trust, &log_sk, &witness_sk);
         let cid = queue.enqueue(&proof).expect("enqueue");
-        let (log_pk, witness_pks, witness_threshold) = verifier_params();
-        let results = queue
-            .process_pending(LOG_ID, &log_pk, &witness_pks, witness_threshold, &log_pk)
-            .expect("process");
+        let results = queue.process_pending(&trust).expect("process");
         assert_eq!(results.len(), 1);
         match &results[0] {
             ProofProcessingResult::Accepted { cid: accepted, .. } => {
@@ -426,16 +417,14 @@ mod tests {
     fn process_rejects_invalid_proofs() {
         let temp = tempdir().expect("tempdir");
         let queue = ProofQueue::new(temp.path()).expect("queue");
-        let mut proof = sample_proof();
+        let (trust, log_sk, witness_sk) = sample_trust();
+        let proof = sample_proof(&trust, &log_sk, &witness_sk);
         let cid_valid = queue.enqueue(&proof).expect("enqueue valid");
         let pending_path = temp.path().join("pending").join(cid_valid.to_string());
         let mut data = fs::read(&pending_path).expect("read");
         data[0] ^= 0xAA;
         fs::write(&pending_path, &data).expect("write tampered");
-        let (log_pk, witness_pks, witness_threshold) = verifier_params();
-        let results = queue
-            .process_pending(LOG_ID, &log_pk, &witness_pks, witness_threshold, &log_pk)
-            .expect("process");
+        let results = queue.process_pending(&trust).expect("process");
         assert_eq!(results.len(), 1);
         assert!(matches!(
             &results[0],
@@ -446,11 +435,10 @@ mod tests {
         ));
         assert!(pending_path.exists());
 
-        proof.sth_sig[0] ^= 0x55;
-        let cid_invalid = queue.enqueue(&proof).expect("enqueue invalid");
-        let results = queue
-            .process_pending(LOG_ID, &log_pk, &witness_pks, witness_threshold, &log_pk)
-            .expect("process invalid");
+        let mut invalid = sample_proof(&trust, &log_sk, &witness_sk);
+        invalid.sth_sig[0] ^= 0x55;
+        let cid_invalid = queue.enqueue(&invalid).expect("enqueue invalid");
+        let results = queue.process_pending(&trust).expect("process invalid");
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|entry| matches!(
             entry,

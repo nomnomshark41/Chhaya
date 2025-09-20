@@ -242,6 +242,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TestVkdKeys;
     use futures::io::Cursor;
     use libp2p::request_response::Codec as _;
 
@@ -253,7 +254,8 @@ mod tests {
         )
         .expect("generate record");
         let spend = crate::make_receipt(record.prekey_batch_root);
-        let vkd = crate::make_vkd_proof(&record);
+        let keys = TestVkdKeys::single_witness();
+        let vkd = crate::make_vkd_proof(&record, &keys);
         let (init, _) =
             crate::initiator_handshake_init::<crate::MlKem1024>(&record, spend, None, vkd)
                 .expect("handshake init");
