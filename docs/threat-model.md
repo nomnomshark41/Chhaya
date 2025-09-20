@@ -51,6 +51,7 @@ This document summarizes the protection goals, scoped non-goals, and adversary a
 * **Mitigations.**
   * Sealed-sender envelopes hide sender identifiers inside the Double Ratchet ciphertext, removing plaintext metadata. [Sealed-sender envelope](./wire-spec.md#sealed-sender-envelope-v1)
   * Handshake padding options obscure DID lengths and batch sizes, complicating straightforward identification. [M1 HandshakeInit](./wire-spec.md#m1-handshakeinit) [Handshake overview](./wire-spec.md#handshake-overview)
+  * Each `RatchetSession` launches cover traffic via the same gossipsub publish path as genuine messages, so idle peers continue emitting padded ciphertext with session-consistent AAD.
 * **Residual risk.** Traffic correlation across multiple network vantage points can still deanonymize users if timing patterns are distinctive or if cover traffic is not sustained.
 
 ### Traffic analysis adversary
@@ -60,6 +61,7 @@ This document summarizes the protection goals, scoped non-goals, and adversary a
   * Cover padding on handshake and Double Ratchet payloads allows peers to equalize message sizes across configurable buckets. [M1 HandshakeInit](./wire-spec.md#m1-handshakeinit) [Double Ratchet transport](./wire-spec.md#double-ratchet-transport)
   * Deterministic, transcript-bound AEAD nonces prevent adversaries from inferring state via nonce randomness variations. [Deterministic nonce derivation](./wire-spec.md#deterministic-nonce-derivation)
   * Constant AAD structure for Double Ratchet ciphertexts avoids leaking extra metadata in headers. [Double Ratchet transport](./wire-spec.md#double-ratchet-transport)
+  * `CoverCfg` exposes tunable budgets and padding buckets so operators can keep background traffic flowing even when applications are quiet, aligning ciphertext sizes for real and cover frames.
 * **Residual risk.** Size buckets and timing padding cannot fully conceal high-volume conversations; sophisticated analysts may still extract communication graphs from flow metadata.
 
 ### Denial of Service adversary

@@ -197,7 +197,7 @@ Double Ratchet messages reuse a constant domain-separated AAD: `"DR" || len(PROT
 All AES-256-GCM operations use HKDF-derived deterministic nonces:
 
 * Handshake nonces call `hkdf_n12(handshake_hash, [role, message_id])`, where `message_id` is 0x02 for M2, 0x03 for M3, and 0x04 for M4. The helper [`hkdf_n12`](../src/lib.rs#L872-L879) is invoked from [`responder_handshake_resp`](../src/lib.rs#L1578-L1608), [`initiator_key_confirm`](../src/lib.rs#L1665-L1678), and [`responder_key_confirm`](../src/lib.rs#L1700-L1711).
-* Double Ratchet message keys derive nonces as `HKDF_n12(message_key, "dr-msg-nonce")` inside the crypto provider used by [`DrPeer`](../src/lib.rs#L1981-L2052); see [`dr_crypto::CryptoProvider`](../src/lib.rs#L1805-L1872).
+* Double Ratchet message keys derive nonces as `HKDF_n12(message_key, "dr-msg-nonce")` inside the crypto provider used by [`DrPeer`](../src/lib.rs#L1980-L2369); see [`dr_crypto::CryptoProvider`](../src/lib.rs#L1805-L1872).
 
 Because the underlying handshake hash and per-direction message keys are unique per session, these deterministic nonces are single-use.
 
@@ -205,38 +205,39 @@ Because the underlying handshake hash and per-direction message keys are unique 
 
 ### Application message container
 
-[`AppMessage`](../src/lib.rs#L1907-L2052) carries Double Ratchet ciphertexts on the wire.
+[`AppMessage`](../src/lib.rs#L1997-L2369) carries Double Ratchet ciphertexts on the wire.
 
 | Field | Size | Notes |
 | --- | --- | --- |
-| `header.dh` | 32 bytes | Diffie-Hellman public key for this ratchet step, serialized by [`HeaderWire`](../src/lib.rs#L1898-L1988). |
-| `header.n` | 4 bytes | Message number (little-endian); must not exceed `DR_MAX_COUNTER`. Enforced in [`DrPeer::receive_message`](../src/lib.rs#L2042-L2052). |
-| `header.pn` | 4 bytes | Previous chain length (little-endian); bounded by `DR_MAX_COUNTER`. Checked alongside `header.n` in [`DrPeer::receive_message`](../src/lib.rs#L2042-L2052). |
-| `ciphertext` | variable | AES-256-GCM output from the Double Ratchet library using deterministic per-message nonces. Produced and consumed by [`DrPeer::send_message`](../src/lib.rs#L2023-L2039) and [`DrPeer::receive_message`](../src/lib.rs#L2042-L2052). |
+| `header.dh` | 32 bytes | Diffie-Hellman public key for this ratchet step, serialized by [`HeaderWire`](../src/lib.rs#L1987-L1991). |
+| `header.n` | 4 bytes | Message number (little-endian); must not exceed `DR_MAX_COUNTER`. Enforced in [`DrPeer::receive_message`](../src/lib.rs#L2359-L2369). |
+| `header.pn` | 4 bytes | Previous chain length (little-endian); bounded by `DR_MAX_COUNTER`. Checked alongside `header.n` in [`DrPeer::receive_message`](../src/lib.rs#L2359-L2369). |
+| `ciphertext` | variable | AES-256-GCM output from the Double Ratchet library using deterministic per-message nonces. Produced and consumed by [`DrPeer::send_message`](../src/lib.rs#L2357-L2375) and [`DrPeer::receive_message`](../src/lib.rs#L2377-L2391). |
 
 ### Sealed-sender envelope v1
 
-Before encryption, application data is wrapped in a [`SealedEnvelope`](../src/lib.rs#L1913-L1959) to hide sender metadata.
+Before encryption, application data is wrapped in a [`SealedEnvelope`](../src/lib.rs#L2004-L2052) to hide sender metadata.
 
 ```text
-0      1      5            5+S         9+S           9+S+P
-+------+-------+------------+-----------+-------------+
-|0x01 | S_le  | sender[S]  | P_le      | payload[P] |
-+------+-------+------------+-----------+-------------+
+0      1      5            5+S         9+S         9+S+P      11+S+P     11+S+P+pad
++------+-------+------------+-----------+-----------+---------+-----------+-------------+
+|0x01 | S_le  | sender[S]  | P_le      | payload[P]| pad_le | pad[pad]  |
++------+-------+------------+-----------+-----------+---------+-----------+-------------+
 ```
 
-* `S_le` and `P_le` are 32-bit little-endian lengths.
-* `S + P + 9` must be ≤ 65,536 bytes (`ENVELOPE_MAX`). Enforced by [`encode_envelope`](../src/lib.rs#L1921-L1928) and checked in [`DrPeer::send_message`](../src/lib.rs#L2023-L2039).
+* `S_le` and `P_le` are 32-bit little-endian lengths; `pad_le` is a 16-bit little-endian padding length.
+* `CoverPadding` selects a target bucket so that `S + P + 11 + pad_le` equals that bucket and remains ≤ 65,536 bytes (`ENVELOPE_MAX`). Enforced by [`encode_envelope`](../src/lib.rs#L2013-L2042) and checked in [`DrPeer::send_message`](../src/lib.rs#L2357-L2375).
+* For backward compatibility the decoder accepts envelopes without the optional padding suffix, treating them as `pad_le = 0`.
 
 Example: Sender=`"alice"` (5 bytes), Payload=`"hi"` (2 bytes) ⇒
 
 ```
-01 05000000 616c696365 02000000 6869
+01 05000000 616c696365 02000000 6869 0000
 ```
 
 ### Sending & receiving
 
-[`DrPeer::send_message`](../src/lib.rs#L2023-L2039) validates envelope size, encrypts using the negotiated Double Ratchet state with caller-supplied AAD (typically `dr_aad()`), and returns `AppMessage`. [`DrPeer::receive_message`](../src/lib.rs#L2042-L2052) enforces counter limits, decrypts, and decodes the envelope.
+[`DrPeer::send_message`](../src/lib.rs#L2343-L2355) validates envelope size, encrypts using the negotiated Double Ratchet state with caller-supplied AAD (typically `dr_aad()`), and returns `AppMessage`. [`DrPeer::receive_message`](../src/lib.rs#L2359-L2369) enforces counter limits, decrypts, and decodes the envelope.
 
 ## Examples
 

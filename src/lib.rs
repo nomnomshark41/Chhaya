@@ -10,7 +10,9 @@ use rand_core_06::{OsRng, RngCore as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::convert::TryInto;
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
@@ -24,6 +26,8 @@ use zeroize::{Zeroize, Zeroizing};
 use libipld::{cbor::DagCborCodec, cid::Cid, codec::Codec, serde::to_ipld};
 use libp2p_identity::PeerId;
 use multihash::{Code, MultihashDigest};
+use tokio::{sync::Mutex, task::JoinHandle, time};
+use tracing::warn;
 
 use crate::directory::MerkleProof;
 use crate::net::ratelimit::RateLimiter;
@@ -1137,6 +1141,109 @@ pub fn decode_label_hash(bytes: &[u8], label: &[u8]) -> Option<[u8; 32]> {
 pub struct CoverCfg {
     pub enabled: AtomicBool,
     pub max_msgs_per_min: AtomicU32,
+    padding: CoverPadding,
+}
+
+impl CoverCfg {
+    pub fn new(enabled: bool, max_msgs_per_min: u32, padding: CoverPadding) -> Self {
+        Self {
+            enabled: AtomicBool::new(enabled),
+            max_msgs_per_min: AtomicU32::new(max_msgs_per_min),
+            padding,
+        }
+    }
+
+    pub fn padding(&self) -> &CoverPadding {
+        &self.padding
+    }
+}
+
+impl Clone for CoverCfg {
+    fn clone(&self) -> Self {
+        Self {
+            enabled: AtomicBool::new(self.enabled.load(Ordering::Relaxed)),
+            max_msgs_per_min: AtomicU32::new(self.max_msgs_per_min.load(Ordering::Relaxed)),
+            padding: self.padding.clone(),
+        }
+    }
+}
+
+impl Default for CoverCfg {
+    fn default() -> Self {
+        Self::new(true, 120, CoverPadding::default())
+    }
+}
+
+#[derive(Clone)]
+pub struct CoverPadding {
+    buckets: Arc<[usize]>,
+}
+
+impl CoverPadding {
+    pub fn new(mut buckets: Vec<usize>) -> Result<Self, CoverPaddingError> {
+        if buckets.is_empty() {
+            return Err(CoverPaddingError::Empty);
+        }
+        buckets.sort_unstable();
+        buckets.dedup();
+        if buckets.windows(2).any(|window| window[0] == window[1]) {
+            return Err(CoverPaddingError::Duplicate);
+        }
+        if let Some(&last) = buckets.last() {
+            if last < ENVELOPE_MIN_TOTAL {
+                return Err(CoverPaddingError::BelowMinimum(last));
+            }
+            if last > ENVELOPE_MAX {
+                return Err(CoverPaddingError::ExceedsMaximum(last));
+            }
+        }
+        Ok(Self {
+            buckets: Arc::from(buckets.into_boxed_slice()),
+        })
+    }
+
+    pub fn buckets(&self) -> &[usize] {
+        &self.buckets
+    }
+
+    pub fn max_bucket(&self) -> usize {
+        *self
+            .buckets
+            .last()
+            .expect("CoverPadding requires at least one bucket")
+    }
+
+    pub fn bucket_for(&self, len: usize) -> Option<usize> {
+        self.buckets.iter().copied().find(|&bucket| bucket >= len)
+    }
+
+    pub fn sample_bucket<R: rand_core_06::RngCore>(&self, rng: &mut R) -> usize {
+        if self.buckets.len() == 1 {
+            return self.buckets[0];
+        }
+        let idx = (rng.next_u32() as usize) % self.buckets.len();
+        self.buckets[idx]
+    }
+}
+
+impl Default for CoverPadding {
+    fn default() -> Self {
+        // Buckets span short chat bursts through to the maximum envelope size.
+        Self::new(vec![512, 1024, 4096, 8192, 16384, 32768, ENVELOPE_MAX])
+            .expect("default padding buckets are valid")
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CoverPaddingError {
+    #[error("no padding buckets configured")]
+    Empty,
+    #[error("duplicate padding bucket configured")]
+    Duplicate,
+    #[error("padding bucket {0} is below minimum envelope size")]
+    BelowMinimum(usize),
+    #[error("padding bucket {0} exceeds envelope size limit {ENVELOPE_MAX}")]
+    ExceedsMaximum(usize),
 }
 
 /// Launches a background thread that emits encrypted cover messages.
@@ -1161,11 +1268,9 @@ where
                 if !cfg.enabled.load(Ordering::Relaxed) {
                     continue;
                 }
-                let mut b = [0u8; 1];
-                rng.fill_bytes(&mut b);
-                let pad_len = bucket_pad_len(b[0]);
-                let mut msg = vec![0u8; pad_len];
-                if pad_len > 0 {
+                let bucket = cfg.padding().sample_bucket(&mut rng);
+                let mut msg = vec![0u8; bucket];
+                if !msg.is_empty() {
                     rng.fill_bytes(&mut msg);
                 }
                 send(msg);
@@ -1874,6 +1979,7 @@ pub use dr_crypto::KeyPair as DrKeyPair;
 /// Wrapper around the Double Ratchet state machine with the crate's crypto provider.
 pub struct DrPeer {
     dr: DoubleRatchet<dr_crypto::CryptoProvider>,
+    padding: Arc<CoverPadding>,
 }
 
 /// Wire-format Double Ratchet header with fixed-length fields.
@@ -1901,16 +2007,33 @@ pub struct SealedEnvelope {
 }
 
 const ENVELOPE_MAX: usize = 64 * 1024;
+const ENVELOPE_MIN_TOTAL: usize = 1 + 4 + 4 + 2;
 const ENVELOPE_V1: u8 = 1;
 
-fn encode_envelope(env: &SealedEnvelope) -> Vec<u8> {
-    let mut out = Vec::new();
+fn encode_envelope(env: &SealedEnvelope, padding: &CoverPadding) -> Result<Vec<u8>, CryptoError> {
+    let base = 1 + 4 + env.sender.len() + 4 + env.payload.len();
+    if base + 2 > ENVELOPE_MAX {
+        return Err(CryptoError::Serde);
+    }
+    let target = padding.bucket_for(base + 2).ok_or(CryptoError::Serde)?;
+    let pad_len = target.checked_sub(base + 2).ok_or(CryptoError::Serde)?;
+    if pad_len > u16::MAX as usize {
+        return Err(CryptoError::Serde);
+    }
+
+    let mut out = Vec::with_capacity(target);
     out.push(ENVELOPE_V1);
     out.extend_from_slice(&(env.sender.len() as u32).to_le_bytes());
     out.extend_from_slice(&env.sender);
     out.extend_from_slice(&(env.payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&env.payload);
-    out
+    out.extend_from_slice(&(pad_len as u16).to_le_bytes());
+    if pad_len > 0 {
+        let mut pad = vec![0u8; pad_len];
+        OsRng.fill_bytes(&mut pad);
+        out.extend_from_slice(&pad);
+    }
+    Ok(out)
 }
 
 /// Decodes a sealed envelope emitted by [`encode_envelope`], enforcing size limits.
@@ -1934,14 +2057,200 @@ pub fn decode_envelope(bytes: &[u8]) -> Option<SealedEnvelope> {
     if payload_len > ENVELOPE_MAX || bytes.len() < idx + payload_len {
         return None;
     }
-    if sender_len + payload_len + 9 > ENVELOPE_MAX {
+    if sender_len + payload_len + 11 > ENVELOPE_MAX {
         return None;
     }
     let payload = bytes[idx..idx + payload_len].to_vec();
-    if idx + payload_len != bytes.len() {
+    idx += payload_len;
+    if idx == bytes.len() {
+        return Some(SealedEnvelope { sender, payload });
+    }
+    if bytes.len() < idx + 2 {
+        return None;
+    }
+    let pad_len = u16::from_le_bytes(bytes[idx..idx + 2].try_into().ok()?) as usize;
+    idx += 2;
+    if bytes.len() != idx + pad_len {
         return None;
     }
     Some(SealedEnvelope { sender, payload })
+}
+
+pub type TransportSendResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+pub type TransportSendFuture = Pin<Box<dyn Future<Output = TransportSendResult> + Send>>;
+pub type TransportSend = Arc<dyn Fn(AppMessage) -> TransportSendFuture + Send + Sync>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    #[error("crypto error: {0:?}")]
+    Crypto(CryptoError),
+    #[error("transport error: {0}")]
+    Transport(String),
+}
+
+impl From<CryptoError> for SessionError {
+    fn from(value: CryptoError) -> Self {
+        Self::Crypto(value)
+    }
+}
+
+pub struct RatchetSession {
+    peer: Arc<Mutex<DrPeer>>,
+    aad: Arc<Vec<u8>>,
+    send: TransportSend,
+    cover_cfg: Arc<CoverCfg>,
+    cover_stop: Arc<AtomicBool>,
+    cover_task: JoinHandle<()>,
+}
+
+impl RatchetSession {
+    pub fn new_initiator(
+        authed: &AuthedSession,
+        peer_pub: X25519Public,
+        send: TransportSend,
+        cover_cfg: Arc<CoverCfg>,
+    ) -> Self {
+        let padding = Arc::new(cover_cfg.padding().clone());
+        let peer = DrPeer::new_initiator_with_padding(authed, peer_pub, padding);
+        Self::from_peer(peer, send, cover_cfg, dr_aad())
+    }
+
+    pub fn new_responder(
+        authed: &AuthedSession,
+        kp: dr_crypto::KeyPair,
+        send: TransportSend,
+        cover_cfg: Arc<CoverCfg>,
+    ) -> Self {
+        let padding = Arc::new(cover_cfg.padding().clone());
+        let peer = DrPeer::new_responder_with_padding(authed, kp, padding);
+        Self::from_peer(peer, send, cover_cfg, dr_aad())
+    }
+
+    fn from_peer(
+        peer: DrPeer,
+        send: TransportSend,
+        cover_cfg: Arc<CoverCfg>,
+        aad: Vec<u8>,
+    ) -> Self {
+        let peer = Arc::new(Mutex::new(peer));
+        let aad = Arc::new(aad);
+        let cover_stop = Arc::new(AtomicBool::new(false));
+        let cover_task = spawn_async_cover(
+            Arc::clone(&peer),
+            Arc::clone(&send),
+            Arc::clone(&cover_cfg),
+            Arc::clone(&aad),
+            Arc::clone(&cover_stop),
+        );
+        Self {
+            peer,
+            aad,
+            send,
+            cover_cfg,
+            cover_stop,
+            cover_task,
+        }
+    }
+
+    pub fn cover_config(&self) -> Arc<CoverCfg> {
+        Arc::clone(&self.cover_cfg)
+    }
+
+    pub async fn send_envelope(&self, env: &SealedEnvelope) -> Result<(), SessionError> {
+        let mut guard = self.peer.lock().await;
+        let msg = guard.send_message(env, self.aad.as_ref())?;
+        drop(guard);
+        (self.send)(msg)
+            .await
+            .map_err(|err| SessionError::Transport(err.to_string()))
+    }
+
+    pub async fn receive_message(&self, msg: &AppMessage) -> Result<SealedEnvelope, CryptoError> {
+        let mut guard = self.peer.lock().await;
+        guard.receive_message(msg, self.aad.as_ref())
+    }
+
+    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+        self.cover_stop.store(true, Ordering::Relaxed);
+        self.cover_task.await
+    }
+}
+
+fn spawn_async_cover(
+    peer: Arc<Mutex<DrPeer>>,
+    send: TransportSend,
+    cfg: Arc<CoverCfg>,
+    aad: Arc<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut rng = OsRng;
+        let mut budget = cfg.max_msgs_per_min.load(Ordering::Relaxed);
+        let mut last_refill = time::Instant::now();
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if last_refill.elapsed() >= Duration::from_secs(60) {
+                budget = cfg.max_msgs_per_min.load(Ordering::Relaxed);
+                last_refill = time::Instant::now();
+            }
+            if cfg.enabled.load(Ordering::Relaxed) && budget > 0 {
+                let mut delay_bytes = [0u8; 8];
+                rng.fill_bytes(&mut delay_bytes);
+                let delay = 100 + (u64::from_le_bytes(delay_bytes) % 900);
+                time::sleep(Duration::from_millis(delay)).await;
+                if stop.load(Ordering::Relaxed) || !cfg.enabled.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let max_sender = cfg.padding().max_bucket().saturating_sub(1 + 4 + 4 + 2);
+                let sender_len = if max_sender == 0 {
+                    0
+                } else {
+                    let min_sender = std::cmp::min(16, max_sender);
+                    let span = max_sender.saturating_sub(min_sender);
+                    let jitter = if span == 0 {
+                        0
+                    } else {
+                        (rng.next_u32() as usize) % (span + 1)
+                    };
+                    min_sender + jitter
+                };
+                let mut sender = vec![0u8; sender_len];
+                if sender_len > 0 {
+                    rng.fill_bytes(&mut sender);
+                }
+                let header_size = 1 + 4 + sender_len + 4;
+                let max_payload = cfg.padding().max_bucket().saturating_sub(header_size + 2);
+                let payload_len = if max_payload == 0 {
+                    0
+                } else {
+                    (rng.next_u32() as usize) % (max_payload + 1)
+                };
+                let mut payload = vec![0u8; payload_len];
+                if payload_len > 0 {
+                    rng.fill_bytes(&mut payload);
+                }
+                let env = SealedEnvelope { sender, payload };
+                let mut guard = peer.lock().await;
+                match guard.send_message(&env, aad.as_ref()) {
+                    Ok(msg) => {
+                        drop(guard);
+                        if let Err(err) = (send)(msg).await {
+                            warn!(target: "cover", "cover transport failed: {err}");
+                        } else {
+                            budget = budget.saturating_sub(1);
+                        }
+                    }
+                    Err(error) => {
+                        warn!(target: "cover", "failed to create cover message: {:?}", error);
+                    }
+                }
+            } else {
+                time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    })
 }
 
 impl From<&Header<dr_crypto::PublicKey>> for HeaderWire {
@@ -1977,17 +2286,33 @@ impl From<HeaderWire> for Header<dr_crypto::PublicKey> {
 impl DrPeer {
     /// Creates a Double Ratchet instance seeded as the initiating party.
     pub fn new_initiator(authed: &AuthedSession, peer_pub: X25519Public) -> Self {
+        Self::new_initiator_with_padding(authed, peer_pub, Arc::new(CoverPadding::default()))
+    }
+
+    pub fn new_initiator_with_padding(
+        authed: &AuthedSession,
+        peer_pub: X25519Public,
+        padding: Arc<CoverPadding>,
+    ) -> Self {
         let root = dr_root_from_handshake((authed.0).handshake_hash);
         let peer = dr_crypto::PublicKey(peer_pub);
         let mut rng = dr_crypto::CompatRng(OsRng);
         let dr = DoubleRatchet::<dr_crypto::CryptoProvider>::new_alice(&root, peer, None, &mut rng);
-        Self { dr }
+        Self { dr, padding }
     }
     /// Creates a Double Ratchet instance seeded as the responding party.
     pub fn new_responder(authed: &AuthedSession, kp: dr_crypto::KeyPair) -> Self {
+        Self::new_responder_with_padding(authed, kp, Arc::new(CoverPadding::default()))
+    }
+
+    pub fn new_responder_with_padding(
+        authed: &AuthedSession,
+        kp: dr_crypto::KeyPair,
+        padding: Arc<CoverPadding>,
+    ) -> Self {
         let root = dr_root_from_handshake((authed.0).handshake_hash);
         let dr = DoubleRatchet::<dr_crypto::CryptoProvider>::new_bob(root, kp, None);
-        Self { dr }
+        Self { dr, padding }
     }
     /// Encrypts an application payload with the current sending ratchet state.
     pub fn encrypt(
@@ -2018,11 +2343,11 @@ impl DrPeer {
     ) -> Result<AppMessage, CryptoError> {
         if env.sender.len() > ENVELOPE_MAX
             || env.payload.len() > ENVELOPE_MAX
-            || env.sender.len() + env.payload.len() + 9 > ENVELOPE_MAX
+            || env.sender.len() + env.payload.len() + 11 > ENVELOPE_MAX
         {
             return Err(CryptoError::Serde);
         }
-        let pt = encode_envelope(env);
+        let pt = encode_envelope(env, &self.padding)?;
         let (header, ciphertext) = self.encrypt(&pt, aad);
         Ok(AppMessage {
             header: HeaderWire::from(&header),
@@ -2477,6 +2802,20 @@ mod tests {
     }
 
     #[test]
+    fn envelope_padding_matches_bucket() {
+        let padding = CoverPadding::new(vec![128]).unwrap();
+        let env = SealedEnvelope {
+            sender: vec![1; 10],
+            payload: vec![2; 5],
+        };
+        let encoded = encode_envelope(&env, &padding).unwrap();
+        assert_eq!(encoded.len(), 128);
+        let decoded = decode_envelope(&encoded).unwrap();
+        assert_eq!(decoded.sender, env.sender);
+        assert_eq!(decoded.payload, env.payload);
+    }
+
+    #[test]
     fn full_flow_with_spend() -> Result<(), HandshakeError> {
         let (record, mut bob_state) = generate_directory_record::<MlKem1024>(
             b"did:example".to_vec(),
@@ -2586,6 +2925,36 @@ mod tests {
         let msg = a.send_message(&env, &aad).unwrap();
         let pt = b.receive_message(&msg, &aad).unwrap();
         assert_eq!(&pt.payload, b"hi bob");
+
+        let cover_cfg = Arc::new(CoverCfg::new(true, 0, CoverPadding::default()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let transport: TransportSend = {
+            let tx = tx.clone();
+            Arc::new(move |msg: AppMessage| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(msg).await;
+                    Ok(())
+                })
+            })
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let session = RatchetSession::new_initiator(
+                &authed_alice,
+                bob_dr_pub,
+                Arc::clone(&transport),
+                Arc::clone(&cover_cfg),
+            );
+            let env = SealedEnvelope {
+                sender: b"alice".to_vec(),
+                payload: b"hi session".to_vec(),
+            };
+            session.send_envelope(&env).await.unwrap();
+            let delivered = rx.recv().await.expect("session emitted message");
+            assert!(!delivered.ciphertext.is_empty());
+            session.shutdown().await.unwrap();
+        });
         Ok(())
     }
 
