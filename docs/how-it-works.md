@@ -13,6 +13,7 @@ Chhaya is a fully peer-to-peer secure messaging protocol that avoids all central
 * **Kademlia DHT:** Nodes advertise their multiaddrs via libp2p Kademlia. Bootstrap happens through previously exchanged peer records or opportunistic LAN discovery (mDNS) when available; there is no central rendezvous service.
 * **Relay and NAT Traversal:** Autonat and relay v2 circuits maintain reachability for peers behind NATs while keeping the overlay decentralized. All messaging runs over QUIC+Noise transport with sealed-sender envelopes and deterministic HKDF-n12 nonces.
 * **Cover Traffic:** Gossip topics blend directory chatter, cover messages, and application payloads so that metadata remains opaque on the wire.
+* **Gossipsub Peer Scoring:** The gossip mesh targets eight neighbours (`mesh_n = 8`, `mesh_n_low = 6`, `mesh_n_high = 12`, `mesh_outbound_min = 3`) and enforces libp2p peer scoring. Behaviour penalties decay over 90s with weight `-20`, invalid payloads incur a `-100` hit, slow delivery adds `-1` penalties, and IP colocation above three peers is penalized with weight `-15`. Thresholds are `gossip ≥ -10`, `publish ≥ -20`, and a graylist at `-40`; peers that fall below graylist are dropped from provider dials and ignored when returning rendezvous results.
 
 ## Threat Model Notes
 

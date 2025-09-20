@@ -6,6 +6,7 @@ mod exchange;
 /// IPFS integration helpers for fetching VKD material.
 pub mod ipfs;
 
+use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, OnceLock};
@@ -21,7 +22,8 @@ use futures::{
 use libp2p::{
     autonat,
     gossipsub::{
-        self, Event as GossipsubEvent, IdentTopic, MessageAcceptance, MessageAuthenticity,
+        self, score_parameter_decay, Event as GossipsubEvent, IdentTopic, MessageAcceptance,
+        MessageAuthenticity, PeerScoreParams, PeerScoreThresholds, TopicScoreParams,
         ValidationMode,
     },
     identify,
@@ -120,6 +122,16 @@ pub struct P2pNode {
 
 const REPLICATION_TOPIC: &str = "p2p-replication";
 const VKD_STH_TOPIC: &str = "/vkd/sth/v1";
+
+const GOSSIP_MESH_N: usize = 8;
+const GOSSIP_MESH_N_LOW: usize = 6;
+const GOSSIP_MESH_N_HIGH: usize = 12;
+const GOSSIP_MESH_OUTBOUND_MIN: usize = 3;
+const GOSSIP_GOSSIP_THRESHOLD: f64 = -10.0;
+const GOSSIP_PUBLISH_THRESHOLD: f64 = -20.0;
+const GOSSIP_GRAYLIST_THRESHOLD: f64 = -40.0;
+const GOSSIP_ACCEPT_PX_THRESHOLD: f64 = 5.0;
+const GOSSIP_OPPORTUNISTIC_GRAFT_THRESHOLD: f64 = 3.0;
 
 impl P2pNode {
     pub async fn run(mut config: P2pConfig) -> Result<Self> {
@@ -631,16 +643,75 @@ fn build_behaviour(
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .validation_mode(validation_mode)
         .validate_messages()
+        .mesh_n(GOSSIP_MESH_N)
+        .mesh_n_low(GOSSIP_MESH_N_LOW)
+        .mesh_n_high(GOSSIP_MESH_N_HIGH)
+        .mesh_outbound_min(GOSSIP_MESH_OUTBOUND_MIN)
         .message_id_fn(|message: &gossipsub::Message| {
             gossipsub::MessageId::from(blake3::hash(&message.data).as_bytes().to_vec())
         })
         .build()
         .context("failed to build gossipsub config")?;
-    let gossipsub = gossipsub::Behaviour::new(
+    let mut gossipsub = gossipsub::Behaviour::new(
         MessageAuthenticity::Signed(keypair.clone()),
         gossipsub_config,
     )
     .map_err(|err| anyhow!(err))?;
+
+    let score_params = PeerScoreParams {
+        topic_score_cap: 64.0,
+        app_specific_weight: 0.0,
+        decay_interval: Duration::from_secs(1),
+        decay_to_zero: 0.01,
+        retain_score: Duration::from_secs(600),
+        behaviour_penalty_weight: -20.0,
+        behaviour_penalty_threshold: 1.0,
+        behaviour_penalty_decay: score_parameter_decay(Duration::from_secs(90)),
+        ip_colocation_factor_weight: -15.0,
+        ip_colocation_factor_threshold: 3.0,
+        slow_peer_weight: -1.0,
+        slow_peer_threshold: 1.0,
+        slow_peer_decay: score_parameter_decay(Duration::from_secs(60)),
+        ..PeerScoreParams::default()
+    };
+
+    let score_thresholds = PeerScoreThresholds {
+        gossip_threshold: GOSSIP_GOSSIP_THRESHOLD,
+        publish_threshold: GOSSIP_PUBLISH_THRESHOLD,
+        graylist_threshold: GOSSIP_GRAYLIST_THRESHOLD,
+        accept_px_threshold: GOSSIP_ACCEPT_PX_THRESHOLD,
+        opportunistic_graft_threshold: GOSSIP_OPPORTUNISTIC_GRAFT_THRESHOLD,
+    };
+
+    gossipsub
+        .with_peer_score(score_params, score_thresholds)
+        .map_err(|err| anyhow!(err))?;
+
+    let topic_params = TopicScoreParams {
+        topic_weight: 1.0,
+        time_in_mesh_cap: 300.0,
+        first_message_deliveries_weight: 2.0,
+        first_message_deliveries_decay: score_parameter_decay(Duration::from_secs(60)),
+        first_message_deliveries_cap: 200.0,
+        mesh_message_deliveries_weight: -3.0,
+        mesh_message_deliveries_decay: score_parameter_decay(Duration::from_secs(60)),
+        mesh_message_deliveries_cap: 20.0,
+        mesh_message_deliveries_threshold: 10.0,
+        mesh_message_deliveries_window: Duration::from_millis(200),
+        mesh_message_deliveries_activation: Duration::from_secs(10),
+        mesh_failure_penalty_weight: -5.0,
+        mesh_failure_penalty_decay: score_parameter_decay(Duration::from_secs(120)),
+        invalid_message_deliveries_weight: -100.0,
+        invalid_message_deliveries_decay: score_parameter_decay(Duration::from_secs(600)),
+        ..TopicScoreParams::default()
+    };
+
+    gossipsub
+        .set_topic_params(IdentTopic::new(REPLICATION_TOPIC), topic_params.clone())
+        .map_err(|err| anyhow!(err))?;
+    gossipsub
+        .set_topic_params(IdentTopic::new(VKD_STH_TOPIC), topic_params)
+        .map_err(|err| anyhow!(err))?;
 
     let autonat = autonat::Behaviour::new(peer_id, Default::default());
 
@@ -978,6 +1049,32 @@ async fn run_swarm(
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         if let Some(keys) = provider_dials.remove(&peer_id) {
+                            if !gossipsub_peer_is_healthy(&swarm, &peer_id) {
+                                let score = gossipsub_peer_score(&swarm, &peer_id);
+                                warn!(
+                                    target: "p2p",
+                                    %peer_id,
+                                    score = score,
+                                    "disconnecting low-score provider"
+                                );
+                                for key in keys {
+                                    tracked_provider_keys.insert(key.clone());
+                                    schedule_provider_refresh(
+                                        key,
+                                        &mut provider_backoff,
+                                        &mut provider_retry,
+                                        true,
+                                    );
+                                }
+                                if swarm.disconnect_peer_id(peer_id).is_err() {
+                                    warn!(
+                                        target: "p2p",
+                                        %peer_id,
+                                        "failed to disconnect low-score provider"
+                                    );
+                                }
+                                continue;
+                            }
                             let entry = active_providers.entry(peer_id).or_default();
                             for key in keys {
                                 entry.insert(key.clone());
@@ -1281,6 +1378,11 @@ fn handle_kademlia_event(
                     if provider_ids.is_empty() {
                         provider_ids.extend(provider_map.keys().copied());
                     }
+                    provider_ids.sort_by(|a, b| {
+                        let score_a = gossipsub_peer_score(swarm, a);
+                        let score_b = gossipsub_peer_score(swarm, b);
+                        score_b.partial_cmp(&score_a).unwrap_or(Ordering::Equal)
+                    });
                     if let Some(state) = pending_provider_queries.get_mut(&id) {
                         let key_bytes = state.key_bytes();
                         let (dial_map, peer_only) =
@@ -1289,6 +1391,16 @@ fn handle_kademlia_event(
 
                         for (peer, addresses) in dial_map {
                             if peer == local_peer_id {
+                                continue;
+                            }
+                            if !gossipsub_peer_is_healthy(swarm, &peer) {
+                                let score = gossipsub_peer_score(swarm, &peer);
+                                warn!(
+                                    target: "p2p",
+                                    %peer,
+                                    score = score,
+                                    "skipping provider with low gossip score"
+                                );
                                 continue;
                             }
                             provider_dials
@@ -1315,6 +1427,16 @@ fn handle_kademlia_event(
                             if peer == local_peer_id {
                                 continue;
                             }
+                            if !gossipsub_peer_is_healthy(swarm, &peer) {
+                                let score = gossipsub_peer_score(swarm, &peer);
+                                warn!(
+                                    target: "p2p",
+                                    %peer,
+                                    score = score,
+                                    "skipping provider without addresses due to low gossip score"
+                                );
+                                continue;
+                            }
                             provider_dials
                                 .entry(peer)
                                 .or_default()
@@ -1336,8 +1458,25 @@ fn handle_kademlia_event(
                 if let Some(mut state) = pending_provider_queries.remove(&id) {
                     state.absorb_store(swarm);
                     let (response, peers) = state.finish();
+                    let filtered_peers: Vec<_> = peers
+                        .into_iter()
+                        .filter(|peer| {
+                            if gossipsub_peer_is_healthy(swarm, &peer.peer_id) {
+                                true
+                            } else {
+                                let score = gossipsub_peer_score(swarm, &peer.peer_id);
+                                warn!(
+                                    target: "p2p",
+                                    peer = %peer.peer_id,
+                                    score = score,
+                                    "dropping low-score provider from response"
+                                );
+                                false
+                            }
+                        })
+                        .collect();
                     if let Some(response) = response {
-                        let _ = response.send(Ok(peers));
+                        let _ = response.send(Ok(filtered_peers));
                     }
                 }
             }
@@ -1396,6 +1535,18 @@ fn parse_replication_payload(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let key = data[2..2 + len].to_vec();
     let value = data[2 + len..].to_vec();
     Some((key, value))
+}
+
+fn gossipsub_peer_score(swarm: &Swarm<NodeBehaviour>, peer_id: &PeerId) -> f64 {
+    swarm
+        .behaviour()
+        .gossipsub
+        .peer_score(peer_id)
+        .unwrap_or_default()
+}
+
+fn gossipsub_peer_is_healthy(swarm: &Swarm<NodeBehaviour>, peer_id: &PeerId) -> bool {
+    gossipsub_peer_score(swarm, peer_id) >= GOSSIP_GRAYLIST_THRESHOLD
 }
 
 #[derive(Debug, Error)]
