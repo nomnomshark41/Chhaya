@@ -1,0 +1,36 @@
+[package]
+name = "chhaya-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+chhaya = { path = ".." }
+
+[[bin]]
+name = "cookie"
+path = "fuzz_targets/cookie.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "resp_ok"
+path = "fuzz_targets/resp_ok.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "label_block"
+path = "fuzz_targets/label_block.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false

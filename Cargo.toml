@@ -1,0 +1,47 @@
+[package]
+name = "chhaya"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+async-trait = "0.1"
+blake3 = "1"
+blstrs = "0.7"
+cid = "0.10"
+clap = { version = "4", features = ["derive"] }
+double-ratchet = "0.1"
+ff = "0.13"
+fips203 = "0.4"
+futures = "0.3"
+group = "0.13"
+hkdf = "0.12"
+hmac = "0.12"
+hex = "0.4"
+libipld = { version = "0.16", default-features = false, features = ["dag-cbor", "serde-codec"] }
+libp2p = { version = "0.56", default-features = false, features = ["autonat", "dns", "gossipsub", "identify", "kad", "macros", "mdns", "noise", "quic", "relay", "request-response", "serde", "tcp", "tokio", "websocket", "yamux"] }
+libp2p-mplex = { version = "0.43", default-features = false }
+libp2p-identity = { version = "0.2", default-features = false, features = ["peerid", "ed25519", "rand"] }
+multihash = { version = "0.18", default-features = false, features = ["sha2"] }
+qrcode = "0.14"
+rand_core_04 = { package = "rand_core", version = "0.4" }
+rand_core_06 = { package = "rand_core", version = "0.6" }
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_cbor = "0.11"
+serde_json = "1"
+sha2 = "0.10"
+sharks = "0.5"
+subtle = "2.4"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = "1.6"
+
+[dev-dependencies]
+proptest = "1"
+rand = "0.8"
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
