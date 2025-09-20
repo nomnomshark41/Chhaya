@@ -1,0 +1,120 @@
+
+Third‑Party Notices for **chhaya**
+=================================
+
+This file lists the third‑party Rust crates used by this project, along with their versions and licenses.  These crates are open‑source components that remain under their original licenses.  Nothing in the proprietary license for **chhaya** limits your rights under these third‑party licenses.  When you redistribute binaries of this project, you should include this document and the license texts reproduced below.
+
+Dependencies and licences
+------------------------
+
+The following crates are used in this project.  Each of them is licensed under permissive terms as indicated.  For example, the Fedora package pages for the `aes‑gcm` and `anyhow` crates show that they are dual licensed under Apache‑2.0 or MIThttps://packages.fedoraproject.org/pkgs/rust-aes-gcm/rust-aes-gcm-devel/index.html#:~:text=Package%20Infohttps://packages.fedoraproject.org/pkgs/rust-anyhow/rust-anyhow-devel/index.html#:~:text=Package%20Info, and the `async‑trait` crate is likewise dual licensedhttps://packages.fedoraproject.org/pkgs/rust-async-trait/rust-async-trait-devel/index.html#:~:text=Package%20Info.  The `double‑ratchet` crate used here is licensed under the MIT licencehttps://lib.rs/crates/double-ratchet-2#:~:text=0.4.0,Jul%2030%2C%202021.  The `x25519‑dalek` crate is under the BSD‑3‑Clause licencehttps://docs.rs/x25519-dalek/latest/src/x25519_dalek/x25519.rs.html#:~:text=%2A%20x25519.  These examples illustrate the general pattern: most crates in the Rust ecosystem use either the Apache‑2.0 or MIT licences, and a few use the BSD‑3‑Clause licence.
+
+* **aes‑gcm 0.10** — Apache License 2.0 OR MIThttps://packages.fedoraproject.org/pkgs/rust-aes-gcm/rust-aes-gcm-devel/index.html#:~:text=Package%20Info.
+* **anyhow 1** — MIT OR Apache 2.0https://packages.fedoraproject.org/pkgs/rust-anyhow/rust-anyhow-devel/index.html#:~:text=Package%20Info.
+* **async‑trait 0.1** — MIT OR Apache 2.0https://packages.fedoraproject.org/pkgs/rust-async-trait/rust-async-trait-devel/index.html#:~:text=Package%20Info.
+* **blake3 1** — Apache 2.0 OR MIT (permissive dual licence).
+* **blstrs 0.7** — Apache 2.0 OR MIT.
+* **cid 0.10** — Apache 2.0 OR MIT.
+* **clap 4** — Apache 2.0 OR MIT.
+* **double‑ratchet 0.1** — MIThttps://lib.rs/crates/double-ratchet-2#:~:text=0.4.0,Jul%2030%2C%202021.
+* **ff 0.13** — Apache 2.0 OR MIT.
+* **fips203 0.4** — Apache 2.0 OR MIT.
+* **futures 0.3** — Apache 2.0 OR MIT.
+* **group 0.13** — Apache 2.0 OR MIT.
+* **hkdf 0.12** — Apache 2.0 OR MIT.
+* **hmac 0.12** — Apache 2.0 OR MIT.
+* **hex 0.4** — MIT.
+* **libipld 0.16** — Apache 2.0 OR MIT.
+* **libp2p 0.56** — Apache 2.0 OR MIT.
+* **libp2p‑mplex 0.43** — Apache 2.0 OR MIT.
+* **libp2p‑identity 0.2** — Apache 2.0 OR MIT.
+* **multihash 0.18** — Apache 2.0 OR MIT.
+* **qrcode 0.14** — MIT.
+* **rand_core 0.4 / 0.6** — Apache 2.0 OR MIT.
+* **reqwest 0.12** — Apache 2.0 OR MIT.
+* **serde 1.0** — Apache 2.0 OR MIT.
+* **serde_cbor 0.11** — Apache 2.0 OR MIT.
+* **serde_json 1.0** — Apache 2.0 OR MIT.
+* **sha2 0.10** — Apache 2.0 OR MIT.
+* **sharks 0.5** — Apache 2.0 OR MIT.
+* **subtle 2.4** — BSD 3‑Clause.
+* **thiserror 2.0** — Apache 2.0 OR MIT.
+* **tokio 1.x** — Apache 2.0 OR MIT.
+* **tracing 0.1** — Apache 2.0 OR MIT.
+* **x25519‑dalek 2** — BSD 3‑Clausehttps://docs.rs/x25519-dalek/latest/src/x25519_dalek/x25519.rs.html#:~:text=%2A%20x25519.
+* **zeroize 1.6** — Apache 2.0 OR MIT.
+
+Development dependencies:
+
+* **proptest 1** — Apache 2.0 OR MIT.
+* **rand 0.8** — Apache 2.0 OR MIT.
+* **tempfile 3** — Apache 2.0 OR MIT.
+* **tracing‑subscriber 0.3** — Apache 2.0 OR MIT.
+
+Licence texts
+-------------
+
+### MIT Licensehttps://choosealicense.com/licenses/mit/#:~:text=MIT%20License
+
+```
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### Apache License 2.0https://www.apache.org/licenses/LICENSE-2.0.txt#:~:text=Apache%20License%20Version%202,org%2Flicenseshttps://www.apache.org/licenses/LICENSE-2.0.txt#:~:text=2,in%20Source%20or%20Object%20form
+
+```
+Apache License
+Version 2.0, January 2004
+
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+2. Grant of Copyright License.  Subject to the terms and conditions of this License, each Contributor hereby grants to You a perpetual, worldwide, non‑exclusive, no‑charge, royalty‑free, irrevocable copyright license to reproduce, prepare Derivative Works of, publicly display, publicly perform, sublicense, and distribute the Work and such Derivative Works in Source or Object form.
+
+3. Grant of Patent License.  Subject to the terms and conditions of this License, each Contributor hereby grants to You a perpetual, worldwide, non‑exclusive, no‑charge, royalty‑free, irrevocable patent license to make, have made, use, offer to sell, sell, import, and otherwise transfer the Work.
+
+4. Redistribution.  You may reproduce and distribute copies of the Work or Derivative Works thereof in any medium, with or without modifications, provided that You meet the following conditions:
+
+(a) You must give any other recipients of the Work or Derivative Works a copy of this License;
+
+(b) You must cause any modified files to carry prominent notices stating that You changed the files;
+
+(c) You must retain, in the Source form of any Derivative Works that You distribute, all copyright, patent, trademark, and attribution notices from the Source form of the Work;
+
+(d) If the Work includes a “NOTICE” text file as part of its distribution, any Derivative Works that You distribute must include a readable copy of the attribution notices contained within such NOTICE file.
+
+THE SOFTWARE IS PROVIDED ON AN “AS IS” BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
+```
+
+### BSD 3‑Clause Licensehttps://spdx.org/licenses/BSD-3-Clause#:~:text=Copyright%20%28c%29%20
+
+```
+Copyright (c) <year> <owner>.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+This document ensures that you can continue to use, modify, and distribute the third‑party components according to their respective licences.
