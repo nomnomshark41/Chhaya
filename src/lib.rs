@@ -670,52 +670,73 @@ fn verify_consistency(
     proof: &[[u8; 32]],
 ) -> bool {
     if old_size == 0 {
-        return true;
+        return proof.is_empty();
     }
     if old_size > new_size {
         return false;
     }
     if old_size == new_size {
-        return old_root == new_root;
+        return proof.is_empty() && old_root == new_root;
     }
-    let mut fn_ = old_size - 1;
-    let mut sn = new_size - 1;
-    let mut fr = old_root;
-    let mut sr = old_root;
-    let mut i = 0usize;
-
-    while fn_ & 1 == 1 {
-        if i >= proof.len() {
-            return false;
-        }
-        fr = hash_pair_internal(&proof[i], &fr);
-        sr = hash_pair_internal(&proof[i], &sr);
-        i += 1;
-        fn_ >>= 1;
-        sn >>= 1;
-    }
-    if i >= proof.len() {
+    if proof.is_empty() {
         return false;
     }
-    sr = proof[i];
-    i += 1;
-    while i < proof.len() {
-        if fn_ & 1 == 1 || fn_ == sn {
-            fr = hash_pair_internal(&proof[i], &fr);
-            sr = hash_pair_internal(&proof[i], &sr);
-            i += 1;
-            while fn_ & 1 == 0 {
-                fn_ >>= 1;
-                sn >>= 1;
-            }
-        } else {
-            sr = hash_pair_internal(&sr, &proof[i]);
-            i += 1;
-        }
-        fn_ >>= 1;
-        sn >>= 1;
+
+    let Ok(mut node) = usize::try_from(old_size.saturating_sub(1)) else {
+        return false;
+    };
+    let Ok(mut last_node) = usize::try_from(new_size.saturating_sub(1)) else {
+        return false;
+    };
+
+    while node & 1 == 1 {
+        node >>= 1;
+        last_node >>= 1;
     }
-    fr == old_root && sr == new_root
+
+    let mut idx = 0usize;
+    let mut old_hash = if node != 0 { proof[idx] } else { old_root };
+    let mut new_hash = old_hash;
+    if node != 0 {
+        idx += 1;
+    }
+
+    while node != 0 {
+        if node & 1 == 1 {
+            if idx >= proof.len() {
+                return false;
+            }
+            let sib = proof[idx];
+            idx += 1;
+            old_hash = hash_pair_internal(&sib, &old_hash);
+            new_hash = hash_pair_internal(&sib, &new_hash);
+        } else if node < last_node {
+            if idx >= proof.len() {
+                return false;
+            }
+            let sib = proof[idx];
+            idx += 1;
+            new_hash = hash_pair_internal(&new_hash, &sib);
+        }
+        node >>= 1;
+        last_node >>= 1;
+    }
+
+    while last_node != 0 {
+        if idx >= proof.len() {
+            return false;
+        }
+        let sib = proof[idx];
+        idx += 1;
+        new_hash = hash_pair_internal(&new_hash, &sib);
+        last_node >>= 1;
+    }
+
+    if idx != proof.len() {
+        return false;
+    }
+
+    old_hash == old_root && new_hash == new_root
 }
 
 /// External verifier for rate-limit receipts bound into the handshake.
@@ -2842,6 +2863,7 @@ mod tests {
         let extra_leaf = h256(b"directory:next");
         log.append(extra_leaf).expect("append additional leaf");
         let proof_update = log.prove(0).expect("prove updated leaf");
+        let consistency_nodes = proof_update.siblings().to_vec();
         let root_update = log.root();
         let tree_size_update = 2u64;
         let sth_time_update = 200u64;
@@ -2875,7 +2897,7 @@ mod tests {
             witness_sigs: witness_sigs_update,
             inclusion_hash: leaf,
             inclusion_proof: proof_update,
-            consistency_proof: Some(vec![root_update]),
+            consistency_proof: Some(consistency_nodes),
             vrf_proof: vrf_sig,
             bundle_cid,
             quorum_desc_cid: quorum_cid,
@@ -2998,6 +3020,39 @@ mod tests {
         .expect("forged trust");
 
         assert!(verify_vkd_proof(&vkd, &forged_trust, None).is_none());
+    }
+
+    #[test]
+    fn vkd_consistency_tampering_rejected() {
+        let (record, _) = generate_directory_record::<MlKem1024>(
+            b"did:example".to_vec(),
+            1,
+            sample_quorum_desc(1),
+        )
+        .unwrap();
+        let keys = TestVkdKeys::single_witness();
+        let (initial_proof, updated_proof) = vkd_proof_chain(&record, &keys);
+
+        let prior = verify_vkd_proof(&initial_proof, &keys.trust, None)
+            .expect("initial proof should verify");
+        verify_vkd_proof(&updated_proof, &keys.trust, Some(prior.clone()))
+            .expect("updated proof should verify");
+
+        let mut missing_consistency = updated_proof.clone();
+        missing_consistency.consistency_proof = None;
+        assert!(verify_vkd_proof(&missing_consistency, &keys.trust, Some(prior.clone())).is_none());
+
+        let mut empty_consistency = updated_proof.clone();
+        empty_consistency.consistency_proof = Some(Vec::new());
+        assert!(verify_vkd_proof(&empty_consistency, &keys.trust, Some(prior.clone())).is_none());
+
+        let mut corrupted_consistency = updated_proof.clone();
+        if let Some(ref mut nodes) = corrupted_consistency.consistency_proof {
+            if let Some(first) = nodes.first_mut() {
+                first[0] ^= 0xAA;
+            }
+        }
+        assert!(verify_vkd_proof(&corrupted_consistency, &keys.trust, Some(prior)).is_none());
     }
 
     #[test]
@@ -3238,6 +3293,149 @@ mod tests {
             Err(other) => panic!("unexpected handshake error: {other:?}"),
             Ok(_) => panic!("stale proof should have been rejected"),
         }
+    }
+
+    #[test]
+    fn responder_rejects_consistency_tampering() {
+        let (record, bob_state) = generate_directory_record::<MlKem1024>(
+            b"did:example".to_vec(),
+            1,
+            sample_quorum_desc(1),
+        )
+        .unwrap();
+        let vkd_keys = TestVkdKeys::single_witness();
+        let (initial_proof, updated_proof) = vkd_proof_chain(&record, &vkd_keys);
+
+        let temp = tempdir().expect("tempdir");
+        let queue = ProofQueue::new(temp.path()).expect("queue");
+        queue.enqueue(&initial_proof).expect("enqueue initial");
+        let results = queue
+            .process_pending(&vkd_keys.trust)
+            .expect("process initial");
+        match results.as_slice() {
+            [ProofProcessingResult::Accepted { .. }] => {}
+            other => panic!("unexpected processing result {other:?}"),
+        }
+        let cached_sth = queue
+            .last_verified_for(vkd_keys.trust.log_id())
+            .expect("load cache")
+            .expect("cached sth present");
+
+        let server_secret = [13u8; 32];
+
+        let attempt = |proof: VkdProof| -> Result<(), HandshakeError> {
+            let spend = make_receipt(record.prekey_batch_root);
+            let replay = TestReplay::default();
+            let verifier = TestSpendVerifier::default();
+            let mut schedule = KeySchedule::new(2, 3, u64::MAX);
+            schedule.rotate(&server_secret, COOKIE_FMT_V1, 0);
+            let mut puzzles = AdaptivePuzzleDifficulty::new(4, 8);
+            let mut rate_limiter = RateLimiter::unlimited();
+            let mut bob_state_local = bob_state.clone();
+
+            let (mut m1, mut alice_state) =
+                initiator_handshake_init::<MlKem1024>(&record, spend, None, proof)?;
+            let keys = schedule.active_keys(1_000_000);
+            let retry = match responder_handshake_resp::<MlKem1024>(
+                ResponderEnv {
+                    keys: &keys,
+                    threshold: schedule.threshold(),
+                    now_ts: 1_000_000,
+                    ttl_secs: 300,
+                    remote_ip: None,
+                    peer_id: None,
+                    puzzle_id: "client1",
+                    puzzles: &mut puzzles,
+                    rate_limiter: &mut rate_limiter,
+                    replay: &replay,
+                    spend_verifier: &verifier,
+                    trust_anchors: &vkd_keys.trust,
+                    last_verified_sth: Some(&cached_sth),
+                },
+                ResponderSession {
+                    message: &m1,
+                    directory: &record,
+                    state: &mut bob_state_local,
+                },
+            ) {
+                Err(HandshakeError::Retry(cookie)) => cookie,
+                Err(other) => return Err(other),
+                Ok(_) => return Err(HandshakeError::Generic),
+            };
+
+            let mut solved = retry.clone();
+            solved.nonce = solve_puzzle(&solved.puzzle);
+            m1.cookie = Some(solved);
+            let quorum_digest = hash_quorum_descriptor(&record.quorum_desc).unwrap();
+            m1.transcript_bind = compute_transcript_bind_v2(TranscriptBindContext {
+                eph_x25519_pub: &m1.eph_x25519_pub,
+                x25519_prekey: &record.x25519_prekey,
+                kem_ciphertext: &m1.kem_ciphertext,
+                did: &m1.did,
+                epoch: m1.epoch,
+                prekey_batch_root: &m1.prekey_batch_root,
+                spend: &m1.spend,
+                sth_cid: &m1.sth_cid,
+                bundle_cid: &m1.bundle_cid,
+                quorum_desc_digest: &quorum_digest,
+                vkd: &m1.vkd_proof,
+                pad: &m1.pad,
+                cookie: m1.cookie.as_ref(),
+            });
+            alice_state.transcript_bind = m1.transcript_bind;
+
+            let keys = schedule.active_keys(1_000_010);
+            responder_handshake_resp::<MlKem1024>(
+                ResponderEnv {
+                    keys: &keys,
+                    threshold: schedule.threshold(),
+                    now_ts: 1_000_010,
+                    ttl_secs: 300,
+                    remote_ip: None,
+                    peer_id: None,
+                    puzzle_id: "client1",
+                    puzzles: &mut puzzles,
+                    rate_limiter: &mut rate_limiter,
+                    replay: &replay,
+                    spend_verifier: &verifier,
+                    trust_anchors: &vkd_keys.trust,
+                    last_verified_sth: Some(&cached_sth),
+                },
+                ResponderSession {
+                    message: &m1,
+                    directory: &record,
+                    state: &mut bob_state_local,
+                },
+            )
+            .map(|_| ())
+        };
+
+        attempt(updated_proof.clone()).expect("valid proof should succeed");
+
+        let mut missing = updated_proof.clone();
+        missing.consistency_proof = None;
+        assert!(matches!(
+            attempt(missing),
+            Err(HandshakeError::DirectoryRollback)
+        ));
+
+        let mut empty = updated_proof.clone();
+        empty.consistency_proof = Some(Vec::new());
+        assert!(matches!(
+            attempt(empty),
+            Err(HandshakeError::DirectoryRollback)
+        ));
+
+        let mut corrupted = updated_proof;
+        if let Some(ref mut nodes) = corrupted.consistency_proof {
+            if let Some(first) = nodes.first_mut() {
+                first[0] ^= 0x44;
+            }
+        }
+        assert!(matches!(
+            attempt(corrupted),
+            Err(HandshakeError::DirectoryRollback)
+        ));
     }
 
     #[test]

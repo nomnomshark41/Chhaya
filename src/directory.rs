@@ -143,6 +143,10 @@ impl MerkleProof {
         }
         hash == root
     }
+
+    pub fn siblings(&self) -> &[[u8; 32]] {
+        &self.siblings
+    }
 }
 
 /// Append-only Merkle log anchoring directory record history.
