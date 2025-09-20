@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::quorum::bls_verify;
 
 const SUPPORTED_VERSION: u32 = 1;
-const CONFIG_SIG_DST: &[u8] = b"CHHAYA_VKD_CONFIG_V1";
+pub(crate) const CONFIG_SIGNATURE_DST: &[u8] = b"CHHAYA_VKD_CONFIG_V1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VkdTrustAnchors {
@@ -127,7 +127,7 @@ impl SignedVkdConfig {
         let message = self.config.signing_message()?;
         let signature =
             decode_g1(&self.signature).ok_or(VkdConfigError::InvalidSignatureEncoding)?;
-        if !bls_verify(signer_pk, &message, &signature, CONFIG_SIG_DST) {
+        if !bls_verify(signer_pk, &message, &signature, CONFIG_SIGNATURE_DST) {
             return Err(VkdConfigError::InvalidSignature);
         }
 
@@ -204,7 +204,7 @@ mod tests {
             vrf_public_key: hex::encode(log_pk.to_affine().to_compressed()),
         };
         let message = config.signing_message().expect("message");
-        let signature = crate::quorum::bls_sign(&signer_sk, &message, CONFIG_SIG_DST);
+        let signature = crate::quorum::bls_sign(&signer_sk, &message, CONFIG_SIGNATURE_DST);
         let signed = SignedVkdConfig {
             config,
             signature: hex::encode(signature.to_affine().to_compressed()),

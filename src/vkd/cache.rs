@@ -18,9 +18,6 @@ use thiserror::Error;
 use crate::vkd::VkdTrustAnchors;
 use crate::{verify_vkd_proof, VerifiedSth, VkdProof};
 
-#[cfg(test)]
-use blstrs::G2Projective;
-
 /// Errors produced while persisting or validating queued VKD proofs.
 #[derive(Debug, Error)]
 pub enum ProofQueueError {
@@ -319,23 +316,17 @@ mod tests {
     use super::*;
     use crate::directory::TransparencyLog;
     use crate::quorum::{bls_sign, SIG_DST};
-    use crate::vkd::VkdTrustAnchors;
-    use blstrs::Scalar;
-    use group::{Curve, Group};
+    use crate::TestVkdKeys;
+    use group::Curve;
     use libipld::multihash::MultihashDigest;
     use tempfile::tempdir;
 
-    fn sample_trust() -> (VkdTrustAnchors, Scalar, Scalar) {
-        let log_sk = Scalar::from(42u64);
-        let witness_sk = Scalar::from(43u64);
-        let log_pk = G2Projective::generator() * log_sk;
-        let witness_pk = G2Projective::generator() * witness_sk;
-        let trust = VkdTrustAnchors::new(b"testlog".to_vec(), log_pk, vec![witness_pk], 1, log_pk)
-            .expect("valid trust anchors");
-        (trust, log_sk, witness_sk)
+    fn sample_keys() -> TestVkdKeys {
+        TestVkdKeys::single_witness()
     }
 
-    fn sample_proof(trust: &VkdTrustAnchors, log_sk: &Scalar, witness_sk: &Scalar) -> VkdProof {
+    fn sample_proof(keys: &TestVkdKeys) -> VkdProof {
+        let trust = &keys.trust;
         let leaf = [7u8; 32];
         let mut log = TransparencyLog::new();
         log.append(leaf).expect("append leaf");
@@ -350,15 +341,19 @@ mod tests {
         tuple.extend_from_slice(&sth_time.to_le_bytes());
         tuple.extend_from_slice(trust.log_id());
 
-        let sth_sig = bls_sign(log_sk, &tuple, SIG_DST)
+        let sth_sig = bls_sign(&keys.log_sk, &tuple, SIG_DST)
             .to_affine()
             .to_compressed()
             .to_vec();
-        let witness_sig = bls_sign(witness_sk, &tuple, SIG_DST)
-            .to_affine()
-            .to_compressed()
-            .to_vec();
-        let vrf_sig = bls_sign(log_sk, &leaf, SIG_DST)
+        let witness_sig = bls_sign(
+            keys.witness_sks.first().expect("at least one witness key"),
+            &tuple,
+            SIG_DST,
+        )
+        .to_affine()
+        .to_compressed()
+        .to_vec();
+        let vrf_sig = bls_sign(&keys.vrf_sk, &leaf, SIG_DST)
             .to_affine()
             .to_compressed()
             .to_vec();
@@ -387,8 +382,8 @@ mod tests {
     fn enqueue_rejects_duplicates() {
         let temp = tempdir().expect("tempdir");
         let queue = ProofQueue::new(temp.path()).expect("queue");
-        let (trust, log_sk, witness_sk) = sample_trust();
-        let proof = sample_proof(&trust, &log_sk, &witness_sk);
+        let keys = sample_keys();
+        let proof = sample_proof(&keys);
         let cid = queue.enqueue(&proof).expect("enqueue");
         let pending = temp.path().join("pending").join(cid.to_string());
         assert!(pending.exists());
@@ -400,8 +395,9 @@ mod tests {
     fn process_moves_verified_proofs() {
         let temp = tempdir().expect("tempdir");
         let queue = ProofQueue::new(temp.path()).expect("queue");
-        let (trust, log_sk, witness_sk) = sample_trust();
-        let proof = sample_proof(&trust, &log_sk, &witness_sk);
+        let keys = sample_keys();
+        let proof = sample_proof(&keys);
+        let trust = keys.trust.clone();
         let cid = queue.enqueue(&proof).expect("enqueue");
         let results = queue.process_pending(&trust).expect("process");
         assert_eq!(results.len(), 1);
@@ -425,8 +421,9 @@ mod tests {
     fn process_rejects_invalid_proofs() {
         let temp = tempdir().expect("tempdir");
         let queue = ProofQueue::new(temp.path()).expect("queue");
-        let (trust, log_sk, witness_sk) = sample_trust();
-        let proof = sample_proof(&trust, &log_sk, &witness_sk);
+        let keys = sample_keys();
+        let trust = keys.trust.clone();
+        let proof = sample_proof(&keys);
         let cid_valid = queue.enqueue(&proof).expect("enqueue valid");
         let pending_path = temp.path().join("pending").join(cid_valid.to_string());
         let mut data = fs::read(&pending_path).expect("read");
@@ -443,7 +440,7 @@ mod tests {
         ));
         assert!(pending_path.exists());
 
-        let mut invalid = sample_proof(&trust, &log_sk, &witness_sk);
+        let mut invalid = sample_proof(&keys);
         invalid.sth_sig[0] ^= 0x55;
         let cid_invalid = queue.enqueue(&invalid).expect("enqueue invalid");
         let results = queue.process_pending(&trust).expect("process invalid");

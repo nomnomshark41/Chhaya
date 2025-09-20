@@ -125,21 +125,15 @@ fn g1_from_bytes(bytes: &[u8]) -> Option<G1Projective> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blstrs::{G1Projective, G2Projective, Scalar};
+    use blstrs::{G1Projective, Scalar};
     use group::{Curve, Group};
     use multihash::{Code, MultihashDigest};
 
     use crate::quorum::{bls_sign, SIG_DST};
-    use crate::vkd::VkdTrustAnchors;
+    use crate::TestVkdKeys;
 
-    fn sample_trust() -> (VkdTrustAnchors, Scalar, Scalar) {
-        let log_sk = Scalar::from(42u64);
-        let witness_sk = Scalar::from(43u64);
-        let log_pk = G2Projective::generator() * log_sk;
-        let witness_pk = G2Projective::generator() * witness_sk;
-        let trust = VkdTrustAnchors::new(b"testlog".to_vec(), log_pk, vec![witness_pk], 1, log_pk)
-            .expect("valid trust anchors");
-        (trust, log_sk, witness_sk)
+    fn sample_keys() -> TestVkdKeys {
+        TestVkdKeys::single_witness()
     }
 
     fn sample_announcement(
@@ -178,30 +172,42 @@ mod tests {
 
     #[test]
     fn accepts_valid_announcement() {
-        let (trust, log_sk, witness_sk) = sample_trust();
-        let announcement = sample_announcement(&trust, &log_sk, &witness_sk);
-        assert!(verify_sth_announcement(&announcement, &trust).is_ok());
+        let keys = sample_keys();
+        let announcement = sample_announcement(
+            &keys.trust,
+            &keys.log_sk,
+            keys.witness_sks.first().expect("witness key"),
+        );
+        assert!(verify_sth_announcement(&announcement, &keys.trust).is_ok());
     }
 
     #[test]
     fn rejects_bad_log_signature() {
-        let (trust, log_sk, witness_sk) = sample_trust();
-        let mut announcement = sample_announcement(&trust, &log_sk, &witness_sk);
+        let keys = sample_keys();
+        let mut announcement = sample_announcement(
+            &keys.trust,
+            &keys.log_sk,
+            keys.witness_sks.first().expect("witness key"),
+        );
         announcement.log_signature = G1Projective::identity()
             .to_affine()
             .to_compressed()
             .to_vec();
-        let err = verify_sth_announcement(&announcement, &trust)
+        let err = verify_sth_announcement(&announcement, &keys.trust)
             .expect_err("invalid signature must be rejected");
         assert!(matches!(err, SthValidationError::MalformedLogSignature));
     }
 
     #[test]
     fn rejects_insufficient_witnesses() {
-        let (trust, log_sk, witness_sk) = sample_trust();
-        let mut announcement = sample_announcement(&trust, &log_sk, &witness_sk);
+        let keys = sample_keys();
+        let mut announcement = sample_announcement(
+            &keys.trust,
+            &keys.log_sk,
+            keys.witness_sks.first().expect("witness key"),
+        );
         announcement.witness_signatures.clear();
-        let err = verify_sth_announcement(&announcement, &trust)
+        let err = verify_sth_announcement(&announcement, &keys.trust)
             .expect_err("missing witnesses must be rejected");
         assert!(matches!(
             err,
@@ -211,11 +217,26 @@ mod tests {
 
     #[test]
     fn rejects_wrong_log_id() {
-        let (trust, log_sk, witness_sk) = sample_trust();
-        let mut announcement = sample_announcement(&trust, &log_sk, &witness_sk);
+        let keys = sample_keys();
+        let mut announcement = sample_announcement(
+            &keys.trust,
+            &keys.log_sk,
+            keys.witness_sks.first().expect("witness key"),
+        );
         announcement.log_id = vec![0xFF];
-        let err = verify_sth_announcement(&announcement, &trust)
+        let err = verify_sth_announcement(&announcement, &keys.trust)
             .expect_err("mismatched log id must be rejected");
         assert!(matches!(err, SthValidationError::LogIdMismatch { .. }));
+    }
+
+    #[test]
+    fn rejects_legacy_default_signature() {
+        let keys = sample_keys();
+        let legacy_log_sk = Scalar::from(42u64);
+        let legacy_witness_sk = Scalar::from(43u64);
+        let announcement = sample_announcement(&keys.trust, &legacy_log_sk, &legacy_witness_sk);
+        let err = verify_sth_announcement(&announcement, &keys.trust)
+            .expect_err("legacy signature must be rejected");
+        assert!(matches!(err, SthValidationError::InvalidLogSignature));
     }
 }

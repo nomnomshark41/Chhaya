@@ -13,13 +13,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
-use blstrs::{G2Projective, Scalar};
 use futures::{
     future::{BoxFuture, Either},
     stream::FuturesUnordered,
     StreamExt,
 };
-use group::Group;
 use libp2p::{
     autonat,
     gossipsub::{
@@ -88,7 +86,7 @@ pub struct P2pConfig {
     pub bootstrap_quorum: Option<bootstrap::TrustedBootstrapQuorum>,
     pub gossip_validation: ValidationMode,
     pub enable_mdns: bool,
-    pub vkd_trust: Arc<VkdTrustAnchors>,
+    pub vkd_trust: Option<Arc<VkdTrustAnchors>>,
 }
 
 impl Default for P2pConfig {
@@ -97,14 +95,6 @@ impl Default for P2pConfig {
         listen.push(Protocol::Ip4(Ipv4Addr::UNSPECIFIED));
         listen.push(Protocol::Udp(0));
         listen.push(Protocol::QuicV1);
-        let default_trust = VkdTrustAnchors::new(
-            b"testlog".to_vec(),
-            G2Projective::generator() * Scalar::from(42u64),
-            vec![G2Projective::generator() * Scalar::from(43u64)],
-            1,
-            G2Projective::generator() * Scalar::from(42u64),
-        )
-        .expect("default VKD trust anchors");
         Self {
             keypair: None,
             listen_addresses: vec![listen],
@@ -113,7 +103,7 @@ impl Default for P2pConfig {
             bootstrap_quorum: None,
             gossip_validation: ValidationMode::Strict,
             enable_mdns: true,
-            vkd_trust: Arc::new(default_trust),
+            vkd_trust: None,
         }
     }
 }
@@ -175,7 +165,10 @@ impl P2pNode {
             info!(target: "p2p", %local_peer_id, "mDNS discovery disabled by configuration");
         }
 
-        let trust = Arc::clone(&config.vkd_trust);
+        let trust = config
+            .vkd_trust
+            .take()
+            .ok_or_else(|| anyhow!("VKD trust anchors must be configured"))?;
 
         let mut swarm = build_swarm(&local_key, config.gossip_validation, enable_mdns)?;
 
@@ -1591,6 +1584,7 @@ mod tests {
     };
     use anyhow::anyhow;
     use async_trait::async_trait;
+    use blstrs::Scalar;
     use group::Curve;
     use libipld::prelude::Codec;
     use libipld::{
@@ -1659,6 +1653,45 @@ mod tests {
         serde_cbor::to_vec(&announcement).expect("encode sth announcement")
     }
 
+    fn build_legacy_sth_message(trust: &VkdTrustAnchors) -> Vec<u8> {
+        let log_id = trust.log_id().to_vec();
+        let root_hash = [17u8; 32];
+        let tree_size = 4u64;
+        let sth_time = 23u64;
+
+        let mut tuple = Vec::new();
+        tuple.extend_from_slice(&root_hash);
+        tuple.extend_from_slice(&tree_size.to_le_bytes());
+        tuple.extend_from_slice(&sth_time.to_le_bytes());
+        tuple.extend_from_slice(&log_id);
+
+        let legacy_log_sk = Scalar::from(42u64);
+        let legacy_witness_sk = Scalar::from(43u64);
+        let log_sig = bls_sign(&legacy_log_sk, &tuple, SIG_DST)
+            .to_affine()
+            .to_compressed()
+            .to_vec();
+        let witness_sig = bls_sign(&legacy_witness_sk, &tuple, SIG_DST)
+            .to_affine()
+            .to_compressed()
+            .to_vec();
+
+        let announcement = SthAnnouncement {
+            sth_cid: Cid::new_v1(
+                u64::from(libipld::cbor::DagCborCodec),
+                Code::Sha2_256.digest(b"sth-legacy"),
+            ),
+            log_id,
+            root_hash,
+            tree_size,
+            sth_time,
+            log_signature: log_sig,
+            witness_signatures: vec![witness_sig],
+        };
+
+        serde_cbor::to_vec(&announcement).expect("encode legacy sth announcement")
+    }
+
     #[test]
     fn sth_validation_accepts_valid_payload() {
         let keys = sample_keys();
@@ -1689,6 +1722,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sth_validation_rejects_legacy_signature() {
+        let keys = sample_keys();
+        let data = build_legacy_sth_message(&keys.trust);
+        match validate_sth_gossip(&data, &keys.trust) {
+            Err(SthGossipError::Validation(SthValidationError::InvalidLogSignature)) => {}
+            other => panic!("expected legacy signature rejection, got {other:?}"),
+        }
+    }
+
     async fn wait_for_listen(node: &P2pNode) -> Result<Vec<(PeerId, Multiaddr)>> {
         for _ in 0..40 {
             let addrs = node.listen_addrs().await?;
@@ -1711,7 +1754,7 @@ mod tests {
         let node_a_config = P2pConfig {
             listen_addresses: vec![listen_addr.clone()],
             enable_mdns: false,
-            vkd_trust: Arc::clone(&trust_arc),
+            vkd_trust: Some(Arc::clone(&trust_arc)),
             ..P2pConfig::default()
         };
         let node_a = P2pNode::run(node_a_config).await?;
@@ -1721,7 +1764,7 @@ mod tests {
             listen_addresses: vec![listen_addr],
             enable_mdns: false,
             bootstrap_peers: node_a_bootstrap.clone(),
-            vkd_trust: Arc::clone(&trust_arc),
+            vkd_trust: Some(Arc::clone(&trust_arc)),
             ..P2pConfig::default()
         };
         let node_b = P2pNode::run(node_b_config).await?;
@@ -1756,7 +1799,7 @@ mod tests {
                 listen_addresses: vec![listen_addr],
                 enable_mdns: false,
                 bootstrap_peers,
-                vkd_trust: Arc::clone(&trust_arc),
+                vkd_trust: Some(Arc::clone(&trust_arc)),
                 ..P2pConfig::default()
             };
 

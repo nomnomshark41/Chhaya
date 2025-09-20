@@ -7,6 +7,8 @@ use blstrs::{G1Affine, G1Projective};
 use blstrs::{G2Projective, Scalar};
 use group::prime::PrimeCurveAffine;
 #[cfg(test)]
+use group::Curve;
+#[cfg(test)]
 use group::Group;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -2514,17 +2516,41 @@ pub(crate) struct TestVkdKeys {
 #[cfg(test)]
 impl TestVkdKeys {
     pub fn single_witness() -> Self {
-        let log_sk = Scalar::from(42u64);
-        let witness_sk = Scalar::from(43u64);
+        let log_sk = Scalar::from(4242u64);
+        let witness_sk = Scalar::from(4343u64);
+        let vrf_sk = log_sk;
         let log_pk = G2Projective::generator() * log_sk;
         let witness_pk = G2Projective::generator() * witness_sk;
-        let trust = VkdTrustAnchors::new(b"testlog".to_vec(), log_pk, vec![witness_pk], 1, log_pk)
+        let vrf_pk = G2Projective::generator() * vrf_sk;
+        let config_signer_sk = Scalar::from(4545u64);
+        let config_signer_pk = G2Projective::generator() * config_signer_sk;
+
+        let config = crate::vkd::VkdConfig {
+            version: 1,
+            log_id: hex::encode(b"testlog"),
+            log_public_key: hex::encode(log_pk.to_affine().to_compressed()),
+            witness_public_keys: vec![hex::encode(witness_pk.to_affine().to_compressed())],
+            witness_threshold: 1,
+            vrf_public_key: hex::encode(vrf_pk.to_affine().to_compressed()),
+        };
+        let message = serde_json::to_vec(&config).expect("config signing message");
+        let signature = crate::quorum::bls_sign(
+            &config_signer_sk,
+            &message,
+            crate::vkd::trust::CONFIG_SIGNATURE_DST,
+        );
+        let signed = crate::vkd::SignedVkdConfig {
+            config,
+            signature: hex::encode(signature.to_affine().to_compressed()),
+        };
+        let trust = signed
+            .verify(&config_signer_pk)
             .expect("valid VKD trust anchors");
         Self {
             trust,
             log_sk,
             witness_sks: vec![witness_sk],
-            vrf_sk: log_sk,
+            vrf_sk,
         }
     }
 }
