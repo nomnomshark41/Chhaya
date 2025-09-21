@@ -64,7 +64,7 @@ use fips203::traits::{
     Decaps as KemDecaps, Encaps as KemEncaps, KeyGen as KemKeyGen, SerDes as KemSerDes,
 };
 
-use sharks::{Share, Sharks};
+use blahaj::{Share, Sharks};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
