@@ -128,3 +128,7 @@ points for new contributors.
 - [`docs/threat-model.md`](docs/threat-model.md) for attacker assumptions and mitigations
 - [`LICENSE`](LICENSE) for licensing information
 
+## License
+
+Chhaya is distributed under the terms of the [GNU Affero General Public License v3.0](LICENSE).
+

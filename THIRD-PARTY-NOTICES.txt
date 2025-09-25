@@ -2,7 +2,7 @@
 Third‑Party Notices for **chhaya**
 =================================
 
-This file lists the third‑party Rust crates used by this project, along with their versions and licenses.  These crates are open‑source components that remain under their original licenses.  Nothing in the proprietary license for **chhaya** limits your rights under these third‑party licenses.  When you redistribute binaries of this project, you should include this document and the license texts reproduced below.
+This file lists the third‑party Rust crates used by this project, along with their versions and licenses.  These crates are open‑source components that remain under their original licenses.  Nothing in the GNU Affero General Public License v3 that now covers **chhaya** limits your rights under these third‑party licenses.  When you redistribute binaries of this project, you should include this document and the license texts reproduced below.
 
 Dependencies and licences
 ------------------------
