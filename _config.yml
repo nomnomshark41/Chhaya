@@ -4,10 +4,10 @@
 # Site settings
 # -----------------------------------------------------------------------------
 title: "Chhaya"
-description: "Peer-to-peer, serverless secure messaging built for end-to-end privacy."
+description: "The Ultimate protocol against prying eyes"
 remote_theme: just-the-docs/just-the-docs
-url: ""
-baseurl: ""
+url: "https://nomnomshark41.github.io"
+baseurl: "/Chhaya"
 
 plugins:
   - jekyll-remote-theme
@@ -24,7 +24,7 @@ color_scheme: dark
 
 aux_links:
   "Chhaya on GitHub":
-    - "https://github.com/openxla/Chhaya"
+    - "https://github.com/nomnomshark41/Chhaya"
 
 footer_content: "Made with 💙 by the Chhaya community."
 
