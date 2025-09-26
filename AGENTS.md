@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## Scope
-These guidelines apply to the entire repository unless a more specific `AGENTS.md` is added deeper in the tree.
+These guidelines apply to the entire repository
 
 ## Project vision
 Chhaya is a fully peer-to-peer, serverless secure-messaging protocol built with async Rust. All contributions must uphold the system goals:
