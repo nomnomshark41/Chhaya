@@ -1,6 +1,14 @@
+---
+layout: default
+title: Wire Specification
+parent: Documentation
+nav_order: 3
+permalink: /docs/wire-spec/
+---
+
 # Wire Format Specification (v1)
 
-This document describes the wire-visible structures and state machines implemented by the Chhaya Rust crate. It covers the authenticated key exchange (messages M1–M4), retry cookies, the sealed-sender envelope, and the Double Ratchet transport. For a higher-level discussion see [How It Works](./how-it-works.md); for adversary analysis consult the [Threat Model](./threat-model.md).
+This document describes the wire-visible structures and state machines implemented by the Chhaya Rust crate. It covers the authenticated key exchange (messages M1–M4), retry cookies, the sealed-sender envelope, and the Double Ratchet transport. For a higher-level discussion see [How It Works](/docs/how-it-works/); for adversary analysis consult the [Threat Model](/docs/threat-model/).
 
 ## Constants
 

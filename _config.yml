@@ -1,0 +1,57 @@
+# Jekyll configuration for the Chhaya project site
+# See https://jekyllrb.com/docs/configuration/ for details.
+
+# Site settings
+# -----------------------------------------------------------------------------
+title: "Chhaya"
+description: "Peer-to-peer, serverless secure messaging built for end-to-end privacy."
+remote_theme: just-the-docs/just-the-docs
+url: ""
+baseurl: ""
+
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+  - jekyll-include-cache
+
+# Navigation & appearance
+# -----------------------------------------------------------------------------
+search_enabled: true
+heading_anchors: true
+back_to_top: true
+back_to_top_text: "Back to top"
+color_scheme: dark
+
+aux_links:
+  "Chhaya on GitHub":
+    - "https://github.com/openxla/Chhaya"
+
+footer_content: "Made with 💙 by the Chhaya community."
+
+# Collections & defaults
+# -----------------------------------------------------------------------------
+defaults:
+  - scope:
+      path: ""
+      type: "pages"
+    values:
+      layout: "default"
+
+# Build settings
+# -----------------------------------------------------------------------------
+markdown: kramdown
+exclude:
+  - ".github"
+  - "bin"
+  - "fuzz"
+  - "src"
+  - "target"
+  - "Cargo.lock"
+  - "Cargo.toml"
+  - "CODE_OF_CONDUCT.md"
+  - "CONTRIBUTING.md"
+  - "HOWTOUSE.md"
+  - "LICENSE"
+  - "README.md"
+  - "SECURITY.md"
+  - "THIRD-PARTY-NOTICES.txt"
