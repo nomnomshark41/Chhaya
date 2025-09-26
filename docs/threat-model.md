@@ -1,3 +1,11 @@
+---
+layout: default
+title: Threat Model
+parent: Documentation
+nav_order: 2
+permalink: /docs/threat-model/
+---
+
 # Threat Model
 
 This document summarizes the protection goals, scoped non-goals, and adversary assumptions for the Chhaya protocol implementation. It links each relevant threat to the mitigations currently embodied in the wire format and highlights residual risk that remains after those controls.

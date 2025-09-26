@@ -1,3 +1,11 @@
+---
+layout: default
+title: How It Works
+parent: Documentation
+nav_order: 1
+permalink: /docs/how-it-works/
+---
+
 # How It Works
 
 Chhaya is a fully peer-to-peer secure messaging protocol that avoids all centralized infrastructure. Peers form ad-hoc mesh overlays and coordinate cryptographic directory data without any trusted services.
