@@ -51,6 +51,8 @@ pub mod p2p;
 pub mod pin;
 /// Threshold BLS quorum coordination helpers.
 pub mod quorum;
+/// Garlic routing with multi-hop circuits and cover traffic.
+pub mod routing;
 /// Human-verifiable safety number presentation helpers.
 pub mod safety;
 /// Secrets handling and audit logging primitives.

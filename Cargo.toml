@@ -46,6 +46,7 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "rt
 tracing = "0.1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = "1.6"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 proptest = "1"

@@ -15,13 +15,13 @@ This document summarizes the protection goals, scoped non-goals, and adversary a
 * **Authenticated directory bindings.** Peers should only accept directory material that is signed by the quorum and provably consistent with the verifiable key directory (VKD), preventing malicious key substitution. [Handshake overview](./wire-spec.md#handshake-overview) [M1 HandshakeInit](./wire-spec.md#m1-handshakeinit)
 * **Confidential, forward-secure transport.** Session establishment and subsequent Double Ratchet transport must preserve message confidentiality, integrity, and post-compromise security using the hybrid handshake and deterministic nonce discipline. [Handshake overview](./wire-spec.md#handshake-overview) [Deterministic nonce derivation](./wire-spec.md#deterministic-nonce-derivation) [Double Ratchet transport](./wire-spec.md#double-ratchet-transport)
 * **Metadata minimization.** Observers should learn as little as practical about communicating parties through sealed-sender envelopes and padding conventions. [M1 HandshakeInit](./wire-spec.md#m1-handshakeinit) [Sealed-sender envelope](./wire-spec.md#sealed-sender-envelope-v1)
+* **Resilience against global passive observers.** Constant-rate circuits, Poisson mixing, and garlic-layered sealed-sender bulbs aim to frustrate network-wide correlation even when every link is monitored. [Garlic routing](./garlic-routing.md#garlic-bulbs-and-cloves) [Timing defences](./garlic-routing.md#timing-defences)
 * **Replay resistance.** Handshakes and Double Ratchet messages should be single-use, rejecting replayed ciphertexts and transcript replays. [State machine verification](./wire-spec.md#state-machine-transitions-and-verification) [Deterministic nonce derivation](./wire-spec.md#deterministic-nonce-derivation)
 * **Resource-bound admission control.** Attackers must solve stateless puzzles before compelling expensive private-key operations, keeping denial-of-service within manageable bounds. [Retry cookie format](./wire-spec.md#retry-cookie-binary-format) [State machine verification](./wire-spec.md#state-machine-transitions-and-verification)
 
 ## Non-Goals
 
 * **Endpoint compromise.** The protocol does not attempt to secure devices that are already compromised or leaking secrets via side channels.
-* **Perfect anonymity against global observers.** Cover traffic and sealed-sender envelopes reduce metadata leakage but do not guarantee full unlinkability against adversaries monitoring all links.
 * **Network-layer availability.** Attacks that entirely partition the underlying transport (e.g., routing black holes) are out of scope.
 
 ## Adversary Scenarios & Mitigations
@@ -62,15 +62,15 @@ This document summarizes the protection goals, scoped non-goals, and adversary a
   * Each `RatchetSession` launches cover traffic via the same gossipsub publish path as genuine messages, so idle peers continue emitting padded ciphertext with session-consistent AAD.
 * **Residual risk.** Traffic correlation across multiple network vantage points can still deanonymize users if timing patterns are distinctive or if cover traffic is not sustained.
 
-### Traffic analysis adversary
+### Global passive traffic analyst
 
-* **Capabilities.** Observes packet sizes, timing, and frequency to infer relationships or message content.
+* **Capabilities.** Observes every overlay link simultaneously, logging packet sizes, timing, and frequency to infer relationships or message content.
 * **Mitigations.**
   * Cover padding on handshake and Double Ratchet payloads allows peers to equalize message sizes across configurable buckets. [M1 HandshakeInit](./wire-spec.md#m1-handshakeinit) [Double Ratchet transport](./wire-spec.md#double-ratchet-transport)
+  * Constant-rate circuit schedulers emit garlic bulbs (with sealed-sender cloves) at Poisson-distributed intervals even when users are idle, reducing timing distinguishers. [Garlic routing](./garlic-routing.md#timing-defences)
   * Deterministic, transcript-bound AEAD nonces prevent adversaries from inferring state via nonce randomness variations. [Deterministic nonce derivation](./wire-spec.md#deterministic-nonce-derivation)
   * Constant AAD structure for Double Ratchet ciphertexts avoids leaking extra metadata in headers. [Double Ratchet transport](./wire-spec.md#double-ratchet-transport)
-  * `CoverCfg` exposes tunable budgets and padding buckets so operators can keep background traffic flowing even when applications are quiet, aligning ciphertext sizes for real and cover frames.
-* **Residual risk.** Size buckets and timing padding cannot fully conceal high-volume conversations; sophisticated analysts may still extract communication graphs from flow metadata.
+* **Residual risk.** Sustained high-volume conversations may still produce detectable flow imbalances; long-term correlation across Poisson-mixed circuits can leak coarse traffic patterns if cover budgets are misconfigured.
 
 ### Denial of Service adversary
 
@@ -89,6 +89,6 @@ This document summarizes the protection goals, scoped non-goals, and adversary a
 | Sybil / Eclipse | Medium | Medium | BLS quorum receipts, VKD inclusion proofs, retry-cookie puzzles. [M1 HandshakeInit](./wire-spec.md#m1-handshakeinit) [State machine verification](./wire-spec.md#state-machine-transitions-and-verification) [Retry cookie format](./wire-spec.md#retry-cookie-binary-format) | Underlying peer selection can still be saturated without complementary overlay defenses.
 | Replay | Medium | Low | Transcript bind replay cache, deterministic nonces, Double Ratchet counters. [State machine verification](./wire-spec.md#state-machine-transitions-and-verification) [Deterministic nonce derivation](./wire-spec.md#deterministic-nonce-derivation) [Double Ratchet transport](./wire-spec.md#double-ratchet-transport) | Device rollback or cache loss may temporarily reopen replay windows.
 | Deanonymization | High | Medium | Sealed-sender envelopes, handshake padding. [Sealed-sender envelope](./wire-spec.md#sealed-sender-envelope-v1) [M1 HandshakeInit](./wire-spec.md#m1-handshakeinit) | Global traffic correlation and long-term timing analysis remain possible.
-| Traffic analysis | Medium | High | Cover padding buckets, deterministic nonce structure, constant AAD. [M1 HandshakeInit](./wire-spec.md#m1-handshakeinit) [Double Ratchet transport](./wire-spec.md#double-ratchet-transport) [Deterministic nonce derivation](./wire-spec.md#deterministic-nonce-derivation) | Size/timing buckets leak coarse patterns and volume information.
+| Global passive traffic analysis | Medium | High | Cover padding buckets, deterministic nonce structure, constant-rate circuits, Poisson mixing. [M1 HandshakeInit](./wire-spec.md#m1-handshakeinit) [Double Ratchet transport](./wire-spec.md#double-ratchet-transport) [Deterministic nonce derivation](./wire-spec.md#deterministic-nonce-derivation) [Garlic routing](./garlic-routing.md#timing-defences) | Long-term correlation and misconfigured cover budgets can still reveal coarse traffic patterns.
 | Denial of service | Medium | Medium | Retry-cookie puzzles, early transcript validation, Double Ratchet bounds. [Retry cookie format](./wire-spec.md#retry-cookie-binary-format) [Handshake overview](./wire-spec.md#handshake-overview) [Double Ratchet transport](./wire-spec.md#double-ratchet-transport) | Large botnets can still saturate bandwidth; puzzles burden resource-constrained clients.
 
