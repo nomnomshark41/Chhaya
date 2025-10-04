@@ -16,7 +16,7 @@ anyhow = "1"
 async-trait = "0.1"
 blake3 = "1"
 blstrs = "0.7"
-cid = "0.10"
+cid = "0.11"
 clap = { version = "4", features = ["derive"] }
 double-ratchet = "0.1"
 ff = "0.13"
