@@ -27,5 +27,5 @@ model, and read the wire specification.
 ## Get involved
 
 - Dive into the [source code](https://github.com/nomnomshark41/Chhaya).
-- Read the [contributing guide](https://github.com/openxla/Chhaya/blob/main/CONTRIBUTING.md) for engineering standards.
+- Read the [contributing guide](https://github.com/nomnomshark41/Chhaya/blob/main/CONTRIBUTING.md) for engineering standards.
 - Join discussions, propose improvements, and help harden the protocol.
