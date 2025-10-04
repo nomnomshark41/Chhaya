@@ -54,4 +54,5 @@ exclude:
   - "LICENSE"
   - "README.md"
   - "SECURITY.md"
+  - "AGENTS.md"
   - "THIRD-PARTY-NOTICES.txt"
