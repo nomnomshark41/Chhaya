@@ -1,3 +1,6 @@
+// This file is part of Chhaya and is licensed under the GNU Affero General Public License v3.0 or later.
+// See the LICENSE file in the project root for license details.
+
 use blstrs::{pairing, G1Projective, G2Affine, G2Projective, Scalar};
 use ff::Field;
 use group::{prime::PrimeCurveAffine, Curve, Group};

@@ -1,3 +1,6 @@
+// This file is part of Chhaya and is licensed under the GNU Affero General Public License v3.0 or later.
+// See the LICENSE file in the project root for license details.
+
 use hex::encode as hex_encode;
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error as StdError;
