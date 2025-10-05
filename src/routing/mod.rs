@@ -273,7 +273,7 @@ impl StatelessPuzzle {
     /// Verify a candidate solution without keeping state.
     pub fn verify(&self, nonce: &[u8]) -> bool {
         let mut digest = Sha256::new();
-        digest.update(&self.challenge);
+        digest.update(self.challenge);
         digest.update(nonce);
         let hash = digest.finalize();
         leading_zero_bits(&hash) >= usize::from(self.difficulty)
